@@ -4,11 +4,12 @@
 
 **读一行反汇编之前,先把这个二进制看明白。**
 
-一个**单文件** [IDA Pro](https://hex-rays.com/) 插件(同时也是命令行工具),帮你自动补齐平时要手动翻半天的信息:
-**C 运行库 / 编译器版本**、**库函数的真实名字**、**每个 libc 调用是干嘛的**、以及算术 / SIMD 指令的**数学含义**。
+一个**单文件** [IDA Pro](https://hex-rays.com/) 插件(同时是命令行工具),帮你恢复逆向时平时要手动重建的上下文:
+**C 运行库 / 编译器版本**、**库函数的真实名字**、以及**每个 libc 调用和 SIMD 指令到底在做什么**——
+而且带上调用现场的**实参和解码后的常量**。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![IDA Pro](https://img.shields.io/badge/IDA%20Pro-7.x%20%7C%208.x%20%7C%209.x-orange.svg)](https://hex-rays.com/)
+[![IDA Pro](https://img.shields.io/badge/IDA%20Pro-7.4%E2%80%939.x-orange.svg)](https://hex-rays.com/)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg)](https://www.python.org/)
 [![Single file](https://img.shields.io/badge/安装-单文件-success.svg)](ida_better_information.py)
 [![Offline](https://img.shields.io/badge/联网-无-lightgrey.svg)](#隐私)
@@ -19,193 +20,114 @@
 
 ---
 
-## 解决什么问题
+## 要解决的问题
 
-在 IDA 里打开一个 stripped、静态链接的 CTF 题,满屏都是 `sub_401A20` 和裸的 `pxor` / `psrlw`。
-真正开始分析逻辑之前,你得先手动回答三个无聊但必须的问题:
+一个 stripped、静态链接的 CTF 题,打开满屏是 `sub_401A20` 和裸的 `pxor` / `syscall`。
+真正开始分析前,你得手动回答同样几个机械问题——*这是哪个 libc、哪些 `sub_*` 其实是
+`fopen` / `malloc`、`mmap(0, n, 7, 0x22, -1, 0)` 到底在申请什么?*
 
-1. **这是哪个版本的 libc?** —— 才能套对应的 FLIRT 签名。
-2. **哪些 `sub_*` 其实就是 `fopen` / `malloc` / `memcpy`?**
-3. **`_m_por(_m_psrlwi(x, 8), _m_psllwi(x, 8))` 到底在算什么?**
-
-**IDA Better Information** 一个快捷键就把这三件事全答了,把答案以函数名 + 注释的形式写进数据库,
-不满意还能一键撤回。
+IDA Better Information 一个快捷键把这些答案给出来,写回为函数名和注释,自己给结论做交叉验证,
+不想要时干净撤回。
 
 ## 功能
 
-| | 功能 | 你得到什么 |
+| | | |
 |---|---|---|
-| 🔎 | **运行库 / 编译器识别** | 目标用的 glibc/musl 精确构建 —— **stripped + 静态链接也能认**,另支持 Go 和 MSVC 版本。 |
-| 🏷️ | **FLIRT 自动套用** | 自动套上匹配的 `glibc_*` / `musl_*` 签名,库函数名字全回来。 |
-| 💬 | **libc 用途注释** | 给每个识别出的 libc 函数加一行"干什么的"(`fopen → 打开文件,返回 FILE*`),反编译里在调用处可见。 |
-| 🧩 | **反编译注释(带实参)** | 在当前函数的**伪代码**里,给**库函数调用**和 **MMX/SSE 指令**加注释,而且**用真实参数**:`sleep(10) → 睡眠 10 秒`、`fopen("flag","rb") → 打开 "flag"(模式 "rb")`、`_m_psrlwi(x,8) → 每16位 右移 >>`。 |
-| 🌐 | **中英双语** | 一键切换,**UI 和注释文字一起变**。 |
-| ↩️ | **一键撤回** | 本次运行改过的每个名字和注释都有快照、可逆。**绝不覆盖**你自己写的名字和注释。 |
-| 📦 | **单文件、离线** | 检测器**和整个指纹库**都在一个 `.py` 里。不用 pip、不联网。 |
-
-## 快速上手
-
-```text
-1. 把 ida_better_information.py 复制进 IDA 的  plugins/  目录。
-2. 打开目标,按  Ctrl-Alt-G。
-3. 面板显示识别到的运行库,勾上要做的事,按 Run。
-```
-
-```
-┌─ IDA Better Information ─────────────────  语言:[中文▾] ┐
-│ type: linux / static                                  │
-│   glibc 2.39     22.2%  348/1566                      │
-│   glibc 2.40     17.4%  272/1566                      │
-│   glibc 2.41     16.5%  256/1551                      │
-│ verdict: glibc 2.39   confidence=high                 │
-│                                                       │
-│ [x] 套用匹配的 FLIRT 签名                              │
-│ [x] 给 libc 函数加注释                                 │
-│ [x] 给当前函数写反编译注释(带实参)                   │
-│                                                       │
-│   [ 重新检测 ]   [ 执行 ]   [ 撤回 ]                    │
-└───────────────────────────────────────────────────────┘
-```
+| 🔎 | **运行库识别** | 精确定位目标的 **glibc / musl 构建**——*包括 stripped + 静态链接*——覆盖 **x86-64、i386、aarch64**;并识别 **Go、Rust、MSVC、MinGW、.NET** 以及 **UPX / PyInstaller / Nuitka** 壳。 |
+| 🏷️ | **FLIRT 自动套用** | 套上匹配的 `glibc_*` / `musl_*` 签名(结论接近时套前几名),并加载 libc 类型库,让命名后的函数恢复真实原型。 |
+| 💬 | **libc 用途注释** | 给每个识别出的 libc 函数加一行"干什么的",在调用处可见。 |
+| 🧩 | **反编译注释** | 在伪代码里,给库函数调用和 MMX/SSE/AVX 指令加注释,带**真实实参**和**解码后的常量**:`open(..., 0)` → `O_RDONLY`、`mmap(..., 7, ...)` → `PROT_READ\|WRITE\|EXEC [RWX]`、`kill(pid, 9)` → `SIGKILL`、`syscall(59)` → `execve`、`_mm_aesenc_si128` → *AES 加密一轮*。`__*_chk` 加固版会还原成真实签名。 |
+| 🌐 | **中英双语** | 一键切换,UI 和所有注释文字一起变。 |
+| ↩️ | **不破坏原文** | 实时注释由反编译器钩子渲染,**不写数据库**;你主动落盘的改动都有快照、可逆,绝不碰你自己的名字和注释。 |
 
 ## 安装
 
-### 作为 IDA 插件
-把这个单文件复制进 IDA 插件目录,重启 IDA:
+把这一个文件丢进 IDA 的插件目录,重启即可——指纹库已内嵌,没有别的要装。
 
 | 系统 | 插件目录 |
 |---|---|
-| Windows | `%APPDATA%\Hex-Rays\IDA Pro\plugins\` 或 `<IDA>\plugins\` |
-| Linux / macOS | `~/.idapro/plugins/` 或 `<IDA>/plugins/` |
+| Windows | `%APPDATA%\Hex-Rays\IDA Pro\plugins\` |
+| Linux / macOS | `~/.idapro/plugins/` |
 
-就这一步 —— 指纹库是内嵌的,没有别的东西要拷。
+打开目标,按 **Ctrl-Alt-G**。
 
-### 作为命令行工具
-同一个文件在普通 CPython 下直接能跑(不需要 IDA):
+## 用法
+
+面板按需检测运行库,并提供以下可独立勾选的操作:
+
+- **反编译实时注释**——默认开启,跟随光标,随改名实时更新,不写数据库。
+- **套用 FLIRT 签名**——命名库函数。
+- **给 libc 函数加注释**——把一行用途说明落盘。
+- **把反编译注释写进数据库**——持久化当前函数的注释。
+- **在反汇编里标注算术 / SIMD**——`xor eax, ebx` → `eax = eax ^ ebx`。
+- **撤回**——还原本次会话写入的一切。
+
+### 命令行
+
+同一个文件在普通 CPython 下直接跑,不需要 IDA:
 
 ```console
-$ python ida_better_information.py ./target
-$ python ida_better_information.py ./target --static --top 8
+python ida_better_information.py ./target
+python ida_better_information.py ./target --arch aarch64 --top 8 --json
 ```
 
-## 原理
+```text
+target    : ./target
+type      : linux / static / x86_64
+  glibc 2.39     22.2%  348/1566  ######
+  glibc 2.40     17.4%  272/1566  #####
+verdict   : glibc 2.39   confidence = high
+  - toolchain: gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)
+  - toolchain cross-check: agrees.
+```
 
-### 运行库识别
+## 检测原理
 
 | 目标 | 方法 |
 |---|---|
-| Linux **glibc**,静态 / stripped | **函数字节指纹**匹配(glibc 2.19 – 2.44) |
-| Linux **musl**(Alpine),静态 | 函数字节指纹匹配(1.1.24、1.2.2 – 1.2.6) |
-| Linux **动态** | 最高的 `GLIBC_2.x` 符号需求(下限)+ GNU build-id → [libc.rip](https://libc.rip) |
-| **Go**(ELF / PE) | 读内嵌的 `go1.x.y` 构建串(精确) |
-| **Windows PE** | Rich header 的链接器 / 构建号(编译器版本) |
+| Linux **glibc / musl**,静态 / stripped | 按架构做**函数字节指纹**匹配 |
+| Linux **动态** | 程序头类型、解释器、`GLIBC_2.x` 下限 + build-id → [libc.rip](https://libc.rip) |
+| **Go / Rust** | 内嵌构建信息(精确版本) |
+| **Windows PE** | Rich 头构建号、链接器版本、托管 / MinGW 标记 |
+| 任意 | `.comment` 工具链字符串,作为独立交叉验证 |
 
-最难的情况 —— 一个 stripped 静态程序,版本号哪都没写 —— 插件取每个已知 libc 构建里各函数的
-**无通配连续字节**,问一个简单又稳的问题:**哪个版本的函数字节在这个程序里出现得最全?**
-出现得最全的那个版本就是答案。
+静态还是动态,是从 **ELF 程序头**(解释器 + `DT_NEEDED`)判定的,不是靠找字符串——所以共享库不会
+被误判成静态可执行文件。最难的情况下,工具取每个已知构建函数的无通配字节段,比对"哪个构建的函数在
+目标里出现得最全"。
 
-### 置信度看的是"领先幅度",不是绝对命中率
+**置信度是相对的。** 小的静态程序只链接它用到的那部分 libc,所以绝对命中率天然只有 20–40%。真正重要
+的是**和第二名的差距**:领先明显就是可信结论,内嵌工具链字符串再给它一次佐证。
 
-一个小的静态程序只会链接它真正用到的那部分 libc,所以**绝对命中率天然就低**(20–40% 很正常、很健康)。
-关键是**比第二名领先多少**:领先明显就是可信的判断。工具给出的 `high` / `medium` / `low`
-来自这个差距,而不是裸百分比 —— 这就是为什么上面 `22.2%` 依然是一个可信的 `glibc 2.39`。
+## 覆盖范围
 
-### 反编译注释(带实参)
-
-你读的是**反编译**,注释就写在那里。在当前函数的伪代码里,插件在调用行上注释两类东西。
-
-**库函数调用——用真实参数:**
-
-| 伪代码调用 | 写入的注释 |
-|---|---|
-| `sleep(10)` | `libc: 睡眠 10 秒` |
-| `fopen("flag.txt", "rb")` | `libc: 打开 "flag.txt"(模式 "rb")` |
-| `malloc(n7 + 8)` | `libc: 分配 n7 + 8 字节` |
-| `memcpy(dst, src, 32)` | `libc: 复制 32 字节 src -> dst` |
-| `read(0, buf, 64)` | `libc: 从 fd 0 读 64 字节` |
-
-**MMX / SSE 内建函数——数学含义:**
-
-| 伪代码 | 注释 |
-|---|---|
-| `_m_pxor(a, b)` | `op: 异或 ^` |
-| `_m_psrlwi(x, 8)` | `op: 每16位 右移 >>` |
-| `_m_psllqi(x, 1)` | `op: 整块64位 左移 <<` |
-| `_m_paddb(a, b)` | `op: 每字节 相加 +` |
-
-参数直接从 Hex-Rays 的 ctree 里读,常量、字符串、变量名都能渲染。只注释**光标所在的那个函数**,
-按函数自愿开启。(另有一个汇编级模式 `xor eax, ebx → eax = eax ^ ebx`,给习惯看反汇编的人用,
-覆盖整数/向量助记符及其 AVX `v` 前缀形式。)
-
-> 这正是当初做这个功能的起因:有道题(强网杯 Butterfly)的加密核心全是 MMX,
-> `psrlw`/`psllw`/`psllq` 看得人头大 —— 标成这样之后,"换字节 + 循环移位 + 逐字节加" 一眼就清楚了。
-
-### 语言
-
-面板上有个下拉框在 **English** 和 **中文** 之间切换,**UI 和每条注释的文字一起变**,选择会被记住。
-
-## FLIRT 签名
-
-识别、libc 注释、数学注释都是**开箱即用**的(指纹库已内嵌)。可选的"套用 FLIRT 签名"那一步,
-套的是 IDA `sig/pc/` 里现成的 `glibc_*` / `musl_*` `.sig`。你可以:
-
-- 用 Hex-Rays **FLAIR**(`pelf` + `sigmake`)从每个 `libc.a` 自己生成,或
-- 直接用社区签名集,例如 [`push0ebp/sig-database`](https://github.com/push0ebp/sig-database)。
-
-内嵌的 `fingerprint.json` 也是同样方式(FLAIR 模式)从公开发行的 Ubuntu `libc6-dev` / `musl-dev`
-包生成的 —— 见 [`tools/`](tools/)。
-
-## 覆盖范围与局限
-
-- 指纹:glibc **2.19 – 2.44**、musl **1.1.24 / 1.2.2 – 1.2.6**,仅 **amd64**。
-- 动态程序只能给**下限**;精确构建用 build-id 去 libc.rip 查。
-- Windows 只给编译器 / 链接器线索,不给精确 CRT 版本。
-- 非 Ubuntu 构建或超出范围的版本命中率可能偏低 —— 工具会提示,并仍给出候选排名。
+- 指纹:glibc **2.19 – 2.44**、musl **1.1.24 / 1.2.2 – 1.2.6**,覆盖 **x86-64、i386、aarch64**
+  (29 个构建 × 3 架构)。
+- x86-64 / i386 / aarch64 的系统调用表,取自 Linux 内核头文件。
+- 动态目标只给**下限**;精确构建用 build-id 在 libc.rip 上定位。
 
 ## 重建指纹库
 
-内嵌的数据块完全可从公开包复现:
+内嵌数据可从公开软件包完整复现(需要 Hex-Rays [FLAIR](https://hex-rays.com/) 的 `pelf`):
 
 ```console
-# 1. 下载 libc6-dev / musl-dev 的 .deb,解出 libc.a,跑 FLAIR pelf → db/*.pat
-tools/build-pattern-db.sh
-tools/build-musl-db.sh
-# 2. 把模式压成 fingerprint.json
-python tools/build-fingerprint.py
-# 3. 把 fingerprint.json 内嵌进单文件插件
-python tools/embed-fingerprint.py
-```
-
-要加版本:在 `tools/build-pattern-db.sh` 里加一行,再跑一遍这三步。
-
-## 仓库结构
-
-```
-ida_better_information.py        插件 + 命令行 + 内嵌指纹库(你只需要装这一个)
-tools/
-  ida_better_information.src.py  源码模板(不含内嵌数据块)
-  embed-fingerprint.py           fingerprint.json → 注入 .py 里的数据块
-  build-pattern-db.sh            Ubuntu libc6-dev .deb → FLAIR 模式(glibc)
-  build-musl-db.sh               musl-dev → FLAIR 模式(musl)
-  build-fingerprint.py           FLAIR 模式 → fingerprint.json
-  fingerprint.json               原始字节锚点库(溯源用)
-README.md · README.zh-CN.md · LICENSE
+python tools/build-db.py --pelf /path/to/flair/pelf      # libc6-dev / musl-dev .deb/.apk → db/<arch>/*.pat
+python tools/build-fingerprint.py db tools/fingerprint.json   # → fingerprint.bin
+python tools/gen-syscalls.py > tools/syscalls.json            # (在 Linux/WSL 上;可选)
+python tools/embed-fingerprint.py                             # 注入 blob → ida_better_information.py
 ```
 
 ## 隐私
 
-全程本地运行。插件不开任何 socket、不往外发任何东西;唯一会"提到"的外链(也只是打印、从不主动访问)
-是给动态程序的一条 libc.rip 提示。
+全部本地运行。插件不开任何网络连接,什么都不往外发;唯一会**打印**(从不访问)的外链是 libc.rip,
+只作为动态程序的提示。
 
 ## 兼容性
 
-IDA Pro 7.x / 8.x / 9.x + Python 3。面板优先用 PySide6(IDA 9 自带),没有则退回 PyQt5,
-再没有则退回原生 `ida_kernwin.Form`。
+IDA Pro 7.4 – 9.x + Python 3。面板优先用 PySide6(IDA 9 自带),退回 PyQt5,再退回原生
+`ida_kernwin.Form`。反编译相关功能需要 Hex-Rays;检测和 FLIRT 不需要。
 
 ## 许可
 
-[MIT](LICENSE)。`fingerprint.json` 的数据由公开发行的 Ubuntu glibc / musl 包经 FLAIR 模式派生而来。
-
-## 致谢
-
-模式生成基于 [Hex-Rays FLAIR](https://hex-rays.com/),并受社区签名集
-[`push0ebp/sig-database`](https://github.com/push0ebp/sig-database) 启发。
+[MIT](LICENSE)。指纹数据由公开分发的 Ubuntu/Alpine glibc、musl 软件包经 FLAIR pattern 派生而来。
+基于 Hex-Rays FLAIR,并受益于社区 FLIRT 签名集
+[`push0ebp/sig-database`](https://github.com/push0ebp/sig-database)。

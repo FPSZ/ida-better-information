@@ -1,60 +1,124 @@
 #!/usr/bin/env python3
-# build-fingerprint.py —— 把 db/*.pat 压成 fingerprint.json(每版本一组"函数字节锚点")
-# 锚点 = FLAIR pattern 里最长的一段无通配字节(>=10字节),用来在目标程序里按字节查找。
-import os, re, json, glob, sys
+# -*- coding: utf-8 -*-
+"""FLAIR patterns (<db>/<arch>/<key>.pat) -> fingerprint database.
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DB   = os.path.join(HERE, "db")
-OUT  = os.path.join(HERE, "fingerprint.json")
+An anchor is the longest wildcard-free byte run (10..24 bytes) of a function's leading
+32-byte FLAIR pattern. Each libc build is represented by the set of its anchors; at
+detection time the build whose anchors appear most completely in the target wins.
 
-MIN_RUN  = 10   # 最短无通配字节数
-MAX_ANCH = 24   # 锚点最多取多少字节
+Two outputs:
+  fingerprint.json  human-readable, {"format": 2, "arches": {arch: {key: [hex, ...]}}}
+  fingerprint.bin   compact form that gets embedded in the plugin (see _decode_fp in
+                    the plugin): anchors stored once per arch, versions as varint deltas.
 
-def longest_literal_run(pat_token: str) -> bytes:
-    """pattern 第一字段形如 '558B..E8........C3';取最长的无'..'连续字节段。"""
-    best = b""
-    i = 0; cur = bytearray()
-    n = len(pat_token)
-    while i + 1 < n:
-        c = pat_token[i:i+2]
-        if c == "..":
-            if len(cur) > len(best): best = bytes(cur)
+usage: python tools/build-fingerprint.py [db_dir] [out.json]
+"""
+import glob, json, os, struct, sys
+
+MIN_RUN = 10    # shortest anchor kept
+MAX_ANCH = 24   # anchors are truncated to this many bytes
+MAGIC = b"IBIFP2"
+
+
+def longest_literal_run(tok):
+    best, cur = b"", bytearray()
+    for i in range(0, len(tok) - 1, 2):
+        c = tok[i:i + 2]
+        try:
+            cur.append(int(c, 16))
+        except ValueError:              # ".." wildcard
+            if len(cur) > len(best):
+                best = bytes(cur)
             cur = bytearray()
-        else:
-            try: cur.append(int(c, 16))
-            except ValueError:
-                if len(cur) > len(best): best = bytes(cur)
-                cur = bytearray()
-        i += 2
-    if len(cur) > len(best): best = bytes(cur)
+    if len(cur) > len(best):
+        best = bytes(cur)
     return best[:MAX_ANCH]
 
-def anchors_from_pat(path: str) -> list:
+
+def anchors_from_pat(path):
     out = set()
     with open(path, "r", errors="ignore") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("---"): continue
+            if not line or line.startswith("---"):
+                continue
             tok = line.split(" ", 1)[0]
-            if len(tok) < 2*MIN_RUN: continue
+            if len(tok) < 2 * MIN_RUN:
+                continue
             run = longest_literal_run(tok)
             if len(run) >= MIN_RUN:
                 out.add(run.hex())
     return sorted(out)
 
+
+def _uvarint(n):
+    b = bytearray()
+    while True:
+        x = n & 0x7F
+        n >>= 7
+        b.append(x | (0x80 if n else 0))
+        if not n:
+            return bytes(b)
+
+
+def _str(s):
+    s = s.encode()
+    return bytes([len(s)]) + s
+
+
+def _version_key(k):
+    fam = 1 if k.startswith("musl") else 0
+    nums = [int(x) for x in k.split("_")[-1].split(".") if x.isdigit()]
+    return (fam, nums)
+
+
+def encode_bin(arches):
+    out = bytearray(MAGIC)
+    out += bytes([len(arches)])
+    for arch, vers in sorted(arches.items()):
+        table = sorted({a for anchors in vers.values() for a in anchors})
+        index = {a: i for i, a in enumerate(table)}
+        out += _str(arch) + _uvarint(len(table))
+        for a in table:
+            raw = bytes.fromhex(a)
+            out += bytes([len(raw)]) + raw
+        out += _uvarint(len(vers))
+        for key in sorted(vers, key=_version_key):
+            idx = sorted(index[a] for a in vers[key])
+            out += _str(key) + _uvarint(len(idx))
+            prev = 0
+            for i in idx:
+                out += _uvarint(i - prev)
+                prev = i
+    return bytes(out)
+
+
 def main():
-    fps = {}
-    pats = sorted(glob.glob(os.path.join(DB, "*.pat")))
-    if not pats:
-        print("no .pat in db/ — run build-pattern-db.sh first"); sys.exit(1)
-    for p in pats:
-        ver = os.path.splitext(os.path.basename(p))[0]
-        a = anchors_from_pat(p)
-        fps[ver] = a
-        print(f"{ver}: {len(a)} anchors")
-    with open(OUT, "w") as f:
-        json.dump(fps, f)
-    print(f"-> wrote {OUT} ({len(fps)} versions)")
+    here = os.path.dirname(os.path.abspath(__file__))
+    db = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "..", "_db")
+    out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(here, "fingerprint.json")
+    arches = {}
+    for arch_dir in sorted(glob.glob(os.path.join(db, "*"))):
+        if not os.path.isdir(arch_dir):
+            continue
+        arch = os.path.basename(arch_dir)
+        for p in sorted(glob.glob(os.path.join(arch_dir, "*.pat"))):
+            key = os.path.splitext(os.path.basename(p))[0]
+            a = anchors_from_pat(p)
+            if a:
+                arches.setdefault(arch, {})[key] = a
+        if arch in arches:
+            n = len({x for v in arches[arch].values() for x in v})
+            print("%-8s %2d builds, %5d distinct anchors" % (arch, len(arches[arch]), n))
+    if not arches:
+        sys.exit("no <arch>/*.pat under %s - run tools/build-db.py first" % db)
+    with open(out, "w") as f:
+        json.dump({"format": 2, "arches": arches}, f, separators=(",", ":"))
+    blob = encode_bin(arches)
+    with open(os.path.splitext(out)[0] + ".bin", "wb") as f:
+        f.write(blob)
+    print("-> %s (%d bytes json, %d bytes bin)" % (out, os.path.getsize(out), len(blob)))
+
 
 if __name__ == "__main__":
     main()
