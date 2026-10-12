@@ -29,7 +29,7 @@ License: MIT
 """
 import os, re, sys, json, gzip, base64, struct
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ======================================================================
 #  Embedded fingerprint database  (gzip + base64 of fingerprint.json)
@@ -301,13 +301,108 @@ if _IN_IDA:
      "start_main":"real entry point, calls main",
     }
     PFX = "libc: "
+    OPX = "op: "
+
+    # ---------- language (en / zh), persisted across sessions ----------
+    try:
+        import ida_diskio
+        _CFG = os.path.join(ida_diskio.get_user_idadir(), "ida_better_information.cfg")
+    except Exception:
+        _CFG = os.path.join(os.path.expanduser("~"), ".ida_better_information.cfg")
+    LANG = "en"
+    def _load_lang():
+        global LANG
+        try:
+            import json as _j
+            v = _j.load(open(_CFG)).get("lang", "en")
+            LANG = v if v in ("en", "zh") else "en"
+        except Exception:
+            LANG = "en"
+    def _save_lang():
+        try:
+            import json as _j
+            _j.dump({"lang": LANG}, open(_CFG, "w"))
+        except Exception:
+            pass
+    _load_lang()
+    def T(en, zh):
+        return zh if LANG == "zh" else en
+
+    # Chinese libc descriptions (same keys as DESC)
+    DESC_ZH = {
+     "fopen":"打开文件,返回FILE*","freopen":"重开/重定向文件流","fclose":"关闭文件流",
+     "fread":"从文件读N字节到缓冲区","fwrite":"把缓冲区N字节写入文件","fseek":"移动文件读写位置",
+     "fseeko":"移动文件读写位置(大文件)","ftell":"取当前文件位置","ftello":"取文件位置(大文件)","rewind":"文件位置回开头",
+     "fgets":"读一行到缓冲区","fputs":"写字符串到流","fgetc":"读一个字符","fputc":"写一个字符",
+     "getc":"读一个字符","putc":"写一个字符","getchar":"从stdin读字符","putchar":"向stdout写字符",
+     "puts":"打印字符串+换行到stdout","gets":"读一行(危险)",
+     "printf":"格式化输出到stdout","fprintf":"格式化输出到流(常stderr)","sprintf":"格式化写入字符串",
+     "snprintf":"格式化写入(带长度上限)","vprintf":"printf的va_list版","vfprintf":"fprintf的va_list版","vsnprintf":"vsnprintf",
+     "scanf":"从stdin格式化读入","fscanf":"从流格式化读入","sscanf":"从字符串解析",
+     "perror":"打印错误到stderr","fflush":"刷新流缓冲","setvbuf":"设置流缓冲","feof":"是否文件尾","ferror":"流是否出错","fileno":"取流的fd",
+     "open":"打开文件(fd)","close":"关闭fd","read":"从fd读","write":"向fd写","lseek":"移动fd位置",
+     "dup":"复制fd","dup2":"复制fd到指定号","pipe":"创建管道",
+     "fork":"创建子进程","execve":"执行程序(替换映像)","execl":"执行程序","execvp":"执行程序(查PATH)",
+     "waitpid":"等待子进程","wait":"等待子进程","kill":"发信号","signal":"设信号处理","sigaction":"设信号处理(高级)",
+     "alarm":"定时SIGALRM","sleep":"睡眠(秒)","usleep":"睡眠(微秒)","nanosleep":"高精度睡眠",
+     "getpid":"取进程ID","getppid":"取父进程ID","getuid":"取用户ID","ptrace":"进程跟踪/反调试常用",
+     "mmap":"映射内存/文件","munmap":"解除内存映射","mprotect":"改内存页权限",
+     "socket":"创建套接字","connect":"连接","bind":"绑定地址","listen":"监听","accept":"接受连接",
+     "send":"发送数据","recv":"接收数据","sendto":"发送(UDP)","recvfrom":"接收(UDP)",
+     "malloc":"分配堆内存","calloc":"分配并清零","realloc":"重分配","free":"释放堆内存",
+     "aligned_alloc":"对齐分配","posix_memalign":"对齐分配",
+     "exit":"退出进程(走清理)","_exit":"立即退出(不清理)","abort":"异常终止(SIGABRT)","atexit":"注册退出回调",
+     "atoi":"字符串转int","atol":"转long","atoll":"转longlong","strtol":"转long(带进制)","strtoul":"转ulong",
+     "strtoll":"转longlong","strtod":"转double","qsort":"快排(带比较)","bsearch":"二分查找",
+     "rand":"伪随机数","srand":"设随机种子","random":"伪随机数","srandom":"设随机种子",
+     "getenv":"读环境变量","setenv":"设环境变量","putenv":"设环境变量","system":"执行shell命令","getopt":"解析命令行选项",
+     "abs":"int绝对值","labs":"long绝对值",
+     "strlen":"求字符串长度","strnlen":"求长度(上限)","strcpy":"复制字符串","strncpy":"复制(上限)",
+     "strcat":"拼接字符串","strncat":"拼接(上限)","strcmp":"比较字符串","strncmp":"比较(前n字节)",
+     "strcasecmp":"比较(忽略大小写)","strncasecmp":"比较(忽略大小写,上限)","strchr":"找字符首现","strrchr":"找字符末现",
+     "strstr":"找子串","strtok":"按分隔符切分","strdup":"复制字符串(malloc)","strndup":"复制(上限)","strerror":"错误码转描述",
+     "memcpy":"内存复制(不重叠)","memmove":"内存复制(可重叠)","memset":"内存填充(常清零)","memcmp":"内存比较",
+     "memchr":"内存找字节","bzero":"内存清零","bcopy":"内存复制","mempcpy":"内存复制返回末尾","stpcpy":"复制返回末尾",
+     "isalpha":"是否字母","isdigit":"是否数字","isalnum":"是否字母数字","isspace":"是否空白","isupper":"是否大写",
+     "islower":"是否小写","isxdigit":"是否十六进制位","toupper":"转大写","tolower":"转小写",
+     "time":"取时间(秒)","gettimeofday":"取时间(微秒)","clock":"取CPU时间","localtime":"时间转本地结构","strftime":"格式化时间",
+     "stack_chk_fail":"栈溢出保护触发(canary失败)","assert_fail":"断言失败","cxa_atexit":"注册析构",
+     "start_main":"程序真正入口,调用main",
+    }
+
+    # MMX/SSE intrinsics as Hex-Rays shows them in the decompiler -> (en, zh).
+    # keyed WITHOUT leading underscores; lookup strips them.
+    INTRIN = {
+     "m_pxor":("^ (xor)","异或 ^"), "m_por":("| (or)","或 |"), "m_pand":("& (and)","与 &"),
+     "m_pandn":("(~a) & b","andnot (~a)&b"),
+     "m_psllwi":("<< per 16b","每16位 左移 <<"), "m_psrlwi":(">> per 16b","每16位 右移 >>"),
+     "m_pslldi":("<< per 32b","每32位 左移 <<"), "m_psrldi":(">> per 32b","每32位 右移 >>"),
+     "m_psllqi":("<< whole 64b","整块64位 左移 <<"), "m_psrlqi":(">> whole 64b","整块64位 右移 >>"),
+     "m_psllw":("<< per 16b","每16位 左移 <<"), "m_psrlw":(">> per 16b","每16位 右移 >>"),
+     "m_pslld":("<< per 32b","每32位 左移 <<"), "m_psrld":(">> per 32b","每32位 右移 >>"),
+     "m_psllq":("<< whole 64b","整块64位 左移 <<"), "m_psrlq":(">> whole 64b","整块64位 右移 >>"),
+     "m_paddb":("+ per byte","每字节 相加 +"), "m_paddw":("+ per 16b","每16位 相加 +"),
+     "m_paddd":("+ per 32b","每32位 相加 +"), "m_paddq":("+ per 64b","每64位 相加 +"),
+     "m_psubb":("- per byte","每字节 相减 -"), "m_psubw":("- per 16b","每16位 相减 -"),
+     "m_psubd":("- per 32b","每32位 相减 -"), "m_psubq":("- per 64b","每64位 相减 -"),
+     "m_pmullw":("* per 16b","每16位 相乘 *"), "m_pmulhw":("* hi per 16b","每16位 相乘取高 *"),
+     "m_empty":("emms (clear MMX)","emms(清空MMX状态)"),
+     "mm_loadu_si128":("load 16 bytes","载入16字节"), "mm_storeu_si128":("store 16 bytes","写出16字节"),
+     "mm_load_si128":("load 16 bytes","载入16字节"), "mm_store_si128":("store 16 bytes","写出16字节"),
+    }
 
     # undo snapshots (accumulated within a session)
-    _undo = {"names": {}, "cmts": {}, "icmts": {}}
+    _undo = {"names": {}, "cmts": {}, "icmts": {}, "pcmts": []}
 
     def _describe(name):
-        d = DESC.get(canon(name))
+        d = (DESC_ZH if LANG == "zh" else DESC).get(canon(name))
         return (PFX + d) if d else None
+
+    def _intrin_note(helper):
+        v = INTRIN.get((helper or "").lstrip("_"))
+        if not v or not v[0]:
+            return None
+        return OPX + (v[1] if LANG == "zh" else v[0])
 
     def annotate_all():
         """Comment recognised libc funcs; keep the user's existing comment; record for undo."""
@@ -406,6 +501,162 @@ if _IN_IDA:
             except Exception: pass
         return n
 
+    # ---------- argument-aware libc templates (decompiler only) ----------
+    # {0},{1},... = rendered actual arguments of the call. If a template can't be
+    # filled, we fall back to the generic DESC text. (en, zh)
+    TMPL = {
+     "sleep":("sleep {0} sec","睡眠 {0} 秒"), "usleep":("sleep {0} us","睡眠 {0} 微秒"),
+     "nanosleep":("high-res sleep","高精度睡眠"), "alarm":("SIGALRM in {0}s","{0} 秒后 SIGALRM"),
+     "fopen":("open {0} (mode {1})","打开 {0}(模式 {1})"),
+     "freopen":("reopen {0} (mode {1})","重开 {0}(模式 {1})"),
+     "open":("open {0}","打开 {0}"), "close":("close fd {0}","关闭 fd {0}"),
+     "read":("read {2} bytes from fd {0}","从 fd {0} 读 {2} 字节"),
+     "write":("write {2} bytes to fd {0}","向 fd {0} 写 {2} 字节"),
+     "lseek":("seek fd {0} to {1}","fd {0} 定位到 {1}"),
+     "fread":("read {1}x{2} bytes -> {0}","读 {1}x{2} 字节 -> {0}"),
+     "fwrite":("write {1}x{2} bytes from {0}","写 {1}x{2} 字节(来自 {0})"),
+     "fseek":("seek {0} to {1}","{0} 定位到 {1}"), "fgets":("read a line -> {0} (max {1})","读一行 -> {0}(上限 {1})"),
+     "malloc":("alloc {0} bytes","分配 {0} 字节"), "calloc":("alloc {0}x{1}, zeroed","分配 {0}x{1} 并清零"),
+     "realloc":("resize {0} -> {1} bytes","把 {0} 重分配为 {1} 字节"), "free":("free {0}","释放 {0}"),
+     "aligned_alloc":("alloc {1} bytes, {0}-aligned","分配 {1} 字节,{0} 对齐"),
+     "memcpy":("copy {2} bytes {1} -> {0}","复制 {2} 字节 {1} -> {0}"),
+     "memmove":("move {2} bytes {1} -> {0}","搬移 {2} 字节 {1} -> {0}"),
+     "memset":("fill {0} with {1}, {2} bytes","把 {0} 填成 {1},共 {2} 字节"),
+     "memcmp":("compare {2} bytes {0},{1}","比较 {2} 字节 {0},{1}"),
+     "mmap":("map {1} bytes","映射 {1} 字节"), "mprotect":("protect {1} bytes @ {0}","改 {0} 起 {1} 字节的权限"),
+     "strlen":("length of {0}","{0} 的长度"), "strcpy":("copy {1} -> {0}","复制 {1} -> {0}"),
+     "strncpy":("copy {2} bytes {1} -> {0}","复制 {2} 字节 {1} -> {0}"),
+     "strcat":("append {1} to {0}","把 {1} 接到 {0}"), "strcmp":("compare {0}, {1}","比较 {0}, {1}"),
+     "strncmp":("compare first {2} bytes of {0}, {1}","比较 {0}, {1} 的前 {2} 字节"),
+     "strstr":("find {1} in {0}","在 {0} 里找 {1}"), "strchr":("find char {1} in {0}","在 {0} 里找字符 {1}"),
+     "strtol":("{0} -> long (base {2})","{0} 转 long(进制 {2})"),
+     "atoi":("{0} -> int","{0} 转 int"), "atol":("{0} -> long","{0} 转 long"),
+     "printf":("printf {0}","按 {0} 格式打印"), "fprintf":("fprintf {1}","按 {1} 格式打印到流"),
+     "sprintf":("sprintf -> {0}, fmt {1}","按 {1} 格式写入 {0}"),
+     "snprintf":("write <= {1} bytes -> {0}, fmt {2}","最多 {1} 字节按 {2} 写入 {0}"),
+     "puts":("print {0} + newline","打印 {0} 并换行"), "fputs":("write {0}","写字符串 {0}"),
+     "putchar":("output char {0}","输出字符 {0}"),
+     "system":("run shell: {0}","执行 shell 命令:{0}"), "getenv":("read env {0}","读环境变量 {0}"),
+     "setenv":("set env {0}={1}","设环境变量 {0}={1}"), "exit":("exit({0})","退出进程 ({0})"),
+     "signal":("on signal {0} -> {1}","信号 {0} 的处理设为 {1}"), "kill":("send signal {1} to pid {0}","给 pid {0} 发信号 {1}"),
+     "ptrace":("ptrace req {0}","ptrace 请求 {0}(常见反调试)"),
+     "qsort":("sort {1} items of {2} bytes","排序 {1} 个元素(每个 {2} 字节)"),
+     "srand":("seed rand = {0}","随机种子 = {0}"),
+    }
+
+    def _arg_text(cfunc, a):
+        import ida_hexrays as hr
+        try:
+            while a.op == hr.cot_cast and a.x is not None:
+                a = a.x
+            op = a.op
+            if op == hr.cot_num:
+                return str(a.numval())
+            if op == hr.cot_str:
+                return '"%s"' % a.string
+            if op == hr.cot_obj:
+                s = idc.get_strlit_contents(a.obj_ea, -1, -1)
+                if s:
+                    try: s = s.decode("utf-8", "replace")
+                    except Exception: s = "%s" % s
+                    s = s.replace("\n", "\\n")
+                    if len(s) > 24: s = s[:24] + "..."
+                    return '"%s"' % s
+                return idc.get_name(a.obj_ea) or ("0x%X" % a.obj_ea)
+            if op == hr.cot_var:
+                return cfunc.lvars[a.v.idx].name
+            if op == hr.cot_ref and a.x is not None and a.x.op == hr.cot_var:
+                return "&" + cfunc.lvars[a.x.v.idx].name
+        except Exception:
+            pass
+        return "?"
+
+    def _call_note(cfunc, e, nm):
+        key = canon(nm)
+        try:
+            A = [_arg_text(cfunc, a) for a in e.a]
+        except Exception:
+            A = []
+        pair = TMPL.get(key)
+        if pair:
+            t = pair[1] if LANG == "zh" else pair[0]
+            try:
+                return PFX + t.format(*A)
+            except Exception:
+                pass
+        d = (DESC_ZH if LANG == "zh" else DESC).get(key)
+        return (PFX + d) if d else None
+
+    # ---------- decompiler (pseudocode) annotation ----------
+    # Writes Hex-Rays comments shown IN the decompiler, on the call lines of the
+    # current function: libc calls (fopen...) and MMX/SSE intrinsics (_m_pxor...).
+    _pse_err = [""]
+
+    def _hx_put(cfunc, ea, text, func_ea):
+        import ida_hexrays as hr
+        for itp in (hr.ITP_SEMI, hr.ITP_BLOCK1, hr.ITP_BLOCK2, hr.ITP_CASE, hr.ITP_COLON,
+                    hr.ITP_CURLY1, hr.ITP_CURLY2, hr.ITP_BRACE1, hr.ITP_BRACE2, hr.ITP_ELSE):
+            tl = hr.treeloc_t(); tl.ea = ea; tl.itp = itp
+            try: prev = cfunc.get_user_cmt(tl, hr.RETRIEVE_ONCE) or ""
+            except Exception: prev = ""
+            if prev.startswith(PFX) or prev.startswith(OPX):
+                return True                                   # already ours, idempotent
+            newtext = text if not prev else (text + "   | " + prev)   # keep user's comment
+            cfunc.set_user_cmt(tl, newtext)
+            cfunc.save_user_cmts(); cfunc.refresh_func_ctext()
+            if not cfunc.has_orphan_cmts():
+                _undo["pcmts"].append((func_ea, ea, itp, prev))
+                return True
+            cfunc.del_orphan_cmts()                           # that spot was wrong, try next
+        return False
+
+    def annotate_pseudo(func_ea=None):
+        """Annotate the CURRENT function in the decompiler. Returns count; -1 cursor not in a
+           function; -2 decompiler unavailable; -3 error (see _pse_err[0])."""
+        _pse_err[0] = ""
+        try:
+            import ida_hexrays as hr
+        except Exception:
+            return -2
+        try:
+            if not hr.init_hexrays_plugin():
+                return -2
+            if func_ea is None:
+                func_ea = ida_kernwin.get_screen_ea()
+            f = ida_funcs.get_func(func_ea)
+            if not f:
+                return -1
+            cfunc = hr.decompile(f.start_ea)
+            if not cfunc:
+                return -2
+            notes = {}
+            class _V(hr.ctree_visitor_t):
+                def __init__(self): hr.ctree_visitor_t.__init__(self, hr.CV_FAST)
+                def visit_expr(self, e):
+                    if e.op == hr.cot_call and e.x is not None and e.ea != idaapi.BADADDR:
+                        note = None
+                        if e.x.op == hr.cot_helper:
+                            note = _intrin_note(e.x.helper)
+                        elif e.x.op == hr.cot_obj:
+                            nm = ida_funcs.get_func_name(e.x.obj_ea) or idc.get_name(e.x.obj_ea) or ""
+                            note = _call_note(cfunc, e, nm)
+                        if note:
+                            notes.setdefault(e.ea, [])
+                            if note not in notes[e.ea]: notes[e.ea].append(note)
+                    return 0
+            _V().apply_to(cfunc.body, None)
+            if not notes:
+                return 0
+            added = 0
+            for ea, lst in notes.items():
+                if _hx_put(cfunc, ea, "   ".join(lst), func_ea):
+                    added += 1
+            cfunc.save_user_cmts(); cfunc.refresh_func_ctext()
+            return added
+        except Exception as ex:
+            _pse_err[0] = "%s" % ex
+            return -3
+
     # ---------- detection / FLIRT ----------
     def run_detection():
         path = idaapi.get_input_file_path()
@@ -418,12 +669,15 @@ if _IN_IDA:
 
     def _fmt(r):
         if not r: return ""
-        lines = ["type: %s / %s" % (r.get("os"), r.get("kind"))]
+        conf = {"high": T("high","高"), "medium": T("medium","中"),
+                "low": T("low","低")}.get(r.get("confidence"), r.get("confidence"))
+        lines = [T("type","类型") + ": %s / %s" % (r.get("os"), r.get("kind"))]
         if r.get("build_id"): lines.append("build-id: %s" % r["build_id"])
-        if r.get("arch"): lines.append("arch: %s  linker: %s" % (r["arch"], r.get("linker")))
+        if r.get("arch"):
+            lines.append(T("arch","架构") + ": %s  " % r["arch"] + T("linker","链接器") + ": %s" % r.get("linker"))
         for v, s, h, n in r.get("ranking", []):
             lines.append("  %-12s %5.1f%%  %d/%d" % (_lib_label(v), s*100, h, n))
-        lines.append("verdict: %s   confidence=%s" % (r.get("best"), r.get("confidence")))
+        lines.append(T("verdict","结论") + ": %s   " % r.get("best") + T("confidence","置信度") + "=%s" % conf)
         for note in r.get("notes", []): lines.append("  . " + note)
         return "\n".join(lines)
 
@@ -443,11 +697,13 @@ if _IN_IDA:
     def do_apply_sig(r):
         kind = r.get("kind"); best = r.get("best") or ""
         if kind in ("pe", "go", "dynamic", "?") or not r.get("ranking"):
-            return "no static glibc/musl signature needed for this type (%s)." % kind
+            return T("no static glibc/musl signature needed for this type (%s).",
+                     "该类型(%s)不需要套静态 glibc/musl 签名。") % kind
         verstr = best.replace("glibc", "").replace("musl", "").strip().lstrip(">=")
         sigs = _find_sigs(verstr)
         if not sigs:
-            return "no FLIRT .sig for %s in IDA sig/pc. Generate one with FLAIR or grab from a community set." % best
+            return T("no FLIRT .sig for %s in IDA sig/pc. Generate one with FLAIR or grab from a community set.",
+                     "IDA sig/pc 里没有 %s 的签名。用 FLAIR 自己生成,或从社区签名集拿一个。") % best
         signame = os.path.splitext(sigs[0])[0]
         before = {ea: (ida_funcs.get_func_name(ea) or "") for ea in idautils.Functions()}
         idaapi.plan_to_apply_idasgn(signame); ida_auto.auto_wait()
@@ -458,25 +714,55 @@ if _IN_IDA:
                 _undo["names"].setdefault(ea, before.get(ea, ""))
                 changed += 1
         named = sum(1 for ea in idautils.Functions() if not (ida_funcs.get_func_name(ea) or "").startswith("sub_"))
-        return "applied %s; named %d this run; %d non-sub_ funcs total." % (signame, changed, named)
+        return T("applied %s; named %d this run; %d non-sub_ funcs total.",
+                 "已套用 %s;本次命名 %d 个,当前非 sub_ 函数共 %d 个。") % (signame, changed, named)
+
+    # IDA's auto-generated names are reserved: you cannot set them by hand, only clear
+    # a name and let IDA regenerate one. Setting e.g. "sub_401CA0" pops "Invalid parameter".
+    _DUMMY_RE = re.compile(r'^(sub_|loc_|locret_|unk_|byte_|word_|dword_|qword_|off_|asc_|'
+                           r'flt_|dbl_|tbyte_|packreal_|stru_|custdata_|algn_|def_|nullsub_|'
+                           r'j_|unknown_libname|__imp_)')
+
+    def _is_dummy_name(nm):
+        return (not nm) or bool(_DUMMY_RE.match(nm))
 
     def do_undo():
-        nn = nc = ni = 0
+        nn = nc = ni = npc = 0
         for ea, old in list(_undo["names"].items()):
             try:
-                ida_name.set_name(ea, old or "", ida_name.SN_NOWARN | ida_name.SN_NOCHECK | ida_name.SN_FORCE)
-                nn += 1
-            except Exception:
-                try: idc.set_name(ea, old or ""); nn += 1
-                except Exception: pass
+                if _is_dummy_name(old):
+                    ok = ida_name.set_name(ea, "", ida_name.SN_NOWARN | ida_name.SN_FORCE)   # clear -> auto name
+                else:
+                    ok = ida_name.set_name(ea, old, ida_name.SN_NOWARN | ida_name.SN_NOCHECK | ida_name.SN_FORCE)
+                if ok: nn += 1
+            except Exception: pass
         for ea, old in list(_undo["cmts"].items()):
             try: idc.set_func_cmt(ea, old or "", 1); nc += 1
             except Exception: pass
         for ea, old in list(_undo["icmts"].items()):
             try: idc.set_cmt(ea, old or "", 0); ni += 1
             except Exception: pass
-        _undo["names"].clear(); _undo["cmts"].clear(); _undo["icmts"].clear(); ida_auto.auto_wait()
-        return "reverted: %d names, %d func comments, %d insn comments." % (nn, nc, ni)
+        if _undo["pcmts"]:                                    # pseudocode comments: re-decompile, restore
+            try:
+                import ida_hexrays as hr
+                byfunc = {}
+                for (fea, ea, itp, old) in _undo["pcmts"]:
+                    byfunc.setdefault(fea, []).append((ea, itp, old))
+                for fea, items in byfunc.items():
+                    try:
+                        cf = hr.decompile(fea)
+                        if not cf: continue
+                        for (ea, itp, old) in items:
+                            tl = hr.treeloc_t(); tl.ea = ea; tl.itp = itp
+                            cf.set_user_cmt(tl, old or ""); npc += 1
+                        cf.save_user_cmts(); cf.refresh_func_ctext()
+                    except Exception: pass
+            except Exception: pass
+        _undo["names"].clear(); _undo["cmts"].clear(); _undo["icmts"].clear(); _undo["pcmts"] = []
+        try: ida_auto.auto_wait()
+        except Exception: pass
+        return T("reverted: %d names, %d func comments, %d insn comments, %d pseudocode comments.",
+                 "已撤回:%d 个函数名、%d 处函数注释、%d 处指令注释、%d 处伪代码注释。") % (nn, nc, ni, npc)
 
     # ---------- dockable panel ----------
     _panel = None
@@ -488,20 +774,46 @@ if _IN_IDA:
                 self.parent = conv(form); self._r = None; self._build()
             def _build(self):
                 L = QtWidgets.QVBoxLayout()
-                L.addWidget(QtWidgets.QLabel("<b>IDA Better Information</b> &mdash; runtime detect / FLIRT / annotate"))
+                top = QtWidgets.QHBoxLayout()
+                self.title = QtWidgets.QLabel("<b>IDA Better Information</b>")
+                top.addWidget(self.title, 1)
+                top.addWidget(QtWidgets.QLabel("Lang:"))
+                self.lang = QtWidgets.QComboBox(); self.lang.addItems(["English", "中文"])
+                self.lang.setCurrentIndex(1 if LANG == "zh" else 0)
+                self.lang.currentIndexChanged.connect(self.on_lang)
+                top.addWidget(self.lang)
+                L.addLayout(top)
                 self.result = QtWidgets.QTextEdit(); self.result.setReadOnly(True); self.result.setMinimumHeight(140)
                 L.addWidget(self.result)
-                self.cb_sig = QtWidgets.QCheckBox("Apply matching FLIRT signature (name library funcs)"); self.cb_sig.setChecked(True)
-                self.cb_ann = QtWidgets.QCheckBox("Annotate libc functions (keeps your comments)"); self.cb_ann.setChecked(True)
-                self.cb_math = QtWidgets.QCheckBox("Annotate math in CURRENT function (eax = eax ^ ebx)"); self.cb_math.setChecked(False)
-                L.addWidget(self.cb_sig); L.addWidget(self.cb_ann); L.addWidget(self.cb_math)
+                self.cb_sig = QtWidgets.QCheckBox(); self.cb_sig.setChecked(True)
+                self.cb_ann = QtWidgets.QCheckBox(); self.cb_ann.setChecked(True)
+                self.cb_pse = QtWidgets.QCheckBox(); self.cb_pse.setChecked(True)
+                L.addWidget(self.cb_sig); L.addWidget(self.cb_ann); L.addWidget(self.cb_pse)
                 h = QtWidgets.QHBoxLayout()
-                b0 = QtWidgets.QPushButton("Re-detect"); b1 = QtWidgets.QPushButton("Run"); b2 = QtWidgets.QPushButton("Undo")
-                b0.clicked.connect(self.on_detect); b1.clicked.connect(self.on_run); b2.clicked.connect(self.on_undo)
-                h.addWidget(b0); h.addWidget(b1); h.addWidget(b2); L.addLayout(h)
-                L.addWidget(QtWidgets.QLabel("log:"))
+                self.b0 = QtWidgets.QPushButton(); self.b1 = QtWidgets.QPushButton(); self.b2 = QtWidgets.QPushButton()
+                self.b0.clicked.connect(self.on_detect); self.b1.clicked.connect(self.on_run); self.b2.clicked.connect(self.on_undo)
+                h.addWidget(self.b0); h.addWidget(self.b1); h.addWidget(self.b2); L.addLayout(h)
+                self.loglabel = QtWidgets.QLabel()
+                L.addWidget(self.loglabel)
                 self.log = QtWidgets.QTextEdit(); self.log.setReadOnly(True); L.addWidget(self.log)
-                self.parent.setLayout(L); self.on_detect()
+                self.parent.setLayout(L)
+                self._retext(); self.on_detect()
+            def _retext(self):
+                self.cb_sig.setText(T("Apply matching FLIRT signature (name library funcs)",
+                                      "套用匹配的 FLIRT 签名（命名库函数）"))
+                self.cb_ann.setText(T("Annotate libc functions (repeatable, keeps your comments)",
+                                      "给 libc 函数加注释（可重复，保留你的注释）"))
+                self.cb_pse.setText(T("Annotate CURRENT function in the decompiler (libc calls + MMX/SSE, with real args)",
+                                      "给当前函数写反编译注释（库调用+MMX/SSE，带实参）"))
+                self.b0.setText(T("Re-detect", "重新检测"))
+                self.b1.setText(T("Run", "执行"))
+                self.b2.setText(T("Undo", "撤回"))
+                self.loglabel.setText(T("log:", "日志："))
+            def on_lang(self, idx):
+                global LANG
+                LANG = "zh" if idx == 1 else "en"
+                _save_lang(); self._retext()
+                if self._r: self.result.setPlainText(_fmt(self._r))
             def on_detect(self):
                 r, err = run_detection(); self._r = r
                 self.result.setPlainText(err if err else _fmt(r))
@@ -509,14 +821,31 @@ if _IN_IDA:
                 out = []
                 if self.cb_sig.isChecked():
                     if not self._r: self.on_detect()
-                    out.append("[sig] " + (do_apply_sig(self._r) if self._r else "detection failed, cannot apply sig."))
+                    out.append("[sig] " + (do_apply_sig(self._r) if self._r
+                               else T("detection failed, cannot apply sig.", "检测失败，无法套签名。")))
                 if self.cb_ann.isChecked():
-                    out.append("[libc] added %d comment(s) this run (yours preserved)." % annotate_all())
-                if self.cb_math.isChecked():
-                    n = annotate_math()
-                    out.append("[math] cursor is not inside a function." if n < 0
-                               else "[math] current function: %d comment(s) added (yours preserved)." % n)
-                if not out: out.append("(nothing selected)")
+                    n = annotate_all()
+                    out.append("[libc] " + T("+%d (on fopen/malloc-type funcs; visible at call sites in the decompiler).",
+                                             "+%d（加在 fopen/malloc 这类函数上；反编译里调用处可见）。") % n)
+                if self.cb_pse.isChecked():
+                    ea = ida_kernwin.get_screen_ea()
+                    nm = ida_funcs.get_func_name(ea) if ida_funcs.get_func(ea) else "?"
+                    n = annotate_pseudo(ea)
+                    if n == -1:
+                        out.append("[pseudo] " + T("cursor is NOT inside a function. Click a line inside a function, then Run.",
+                                                   "光标不在函数里。先在某个函数内点一行，再执行。"))
+                    elif n == -2:
+                        out.append("[pseudo] " + T("the Hex-Rays decompiler is not available.",
+                                                   "没有 Hex-Rays 反编译器，写不了伪代码注释。"))
+                    elif n == -3:
+                        out.append("[pseudo] " + T("error: ", "出错：") + _pse_err[0])
+                    elif n == 0:
+                        out.append("[pseudo] %s: " % nm + T("0 added (no libc/MMX calls, or already annotated).",
+                                                            "+0（没有可识别的库/MMX 调用，或已注释过）。"))
+                    else:
+                        out.append("[pseudo] %s: " % nm + T("+%d comment(s) right in the pseudocode.",
+                                                            "+%d 处注释，就在伪代码里。") % n)
+                if not out: out.append(T("(nothing selected)", "（什么都没勾）"))
                 self.log.append("\n".join(out))
                 if self._r: self.result.setPlainText(_fmt(self._r))
             def on_undo(self):
@@ -533,11 +862,11 @@ if _IN_IDA:
 %s
 <##Apply matching FLIRT signature:{rSig}>
 <##Annotate libc functions (keep yours):{rAnn}>
-<##Annotate math in current function:{rMath}>
+<##Annotate current function in decompiler:{rPse}>
 <##Undo last run:{rUndo}>{cG}>
 """ % _fmt(r).replace("%", "%%"),
-                {"cG": ida_kernwin.Form.ChkGroupControl(("rSig", "rAnn", "rMath", "rUndo"))})
-            f.Compile(); f.rSig.checked = True; f.rAnn.checked = True; f.rMath.checked = False; f.rUndo.checked = False
+                {"cG": ida_kernwin.Form.ChkGroupControl(("rSig", "rAnn", "rPse", "rUndo"))})
+            f.Compile(); f.rSig.checked = True; f.rAnn.checked = True; f.rPse.checked = True; f.rUndo.checked = False
             if f.Execute() == 1:
                 msg = []
                 if f.rUndo.checked:
@@ -545,9 +874,11 @@ if _IN_IDA:
                 else:
                     if f.rSig.checked: msg.append("[sig] " + do_apply_sig(r))
                     if f.rAnn.checked: msg.append("[libc] added %d." % annotate_all())
-                    if f.rMath.checked:
-                        n = annotate_math()
-                        msg.append("[math] cursor not in a function." if n < 0 else "[math] added %d." % n)
+                    if f.rPse.checked:
+                        n = annotate_pseudo()
+                        msg.append("[pseudo] " + ("cursor not in a function." if n == -1 else
+                                                  ("no decompiler." if n == -2 else
+                                                   ("error: " + _pse_err[0] if n == -3 else "added %d." % n))))
                 print("\n".join(msg)); ida_kernwin.info("\n".join(msg) or "nothing to do")
             f.Free(); return
         _panel = IBIPanel()
@@ -561,7 +892,8 @@ if _IN_IDA:
         wanted_name = "IDA Better Information"
         wanted_hotkey = "Ctrl-Alt-G"
         def init(self):
-            print("[IDA Better Information] loaded. Press Ctrl-Alt-G.")
+            print("[IDA Better Information] " + T("loaded. Press Ctrl-Alt-G.",
+                                                  "已加载。按 Ctrl-Alt-G 打开面板。"))
             return idaapi.PLUGIN_KEEP
         def term(self): pass
         def run(self, arg): open_panel()

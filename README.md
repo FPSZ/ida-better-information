@@ -40,8 +40,9 @@ database as names and comments, and lets you undo the whole thing if you don't l
 |---|---|---|
 | 🔎 | **Runtime / compiler detection** | The exact glibc/musl build of a target — **even stripped & statically linked** — plus Go and MSVC versions. |
 | 🏷️ | **FLIRT auto-apply** | Applies the matching `glibc_*` / `musl_*` signature so library functions regain their real names. |
-| 💬 | **libc annotations** | A one-line *what-it-does* note on every recognised libc function (`fopen → open a file, returns FILE*`). |
-| ➗ | **Math annotations** | Rewrites arithmetic / logic / **MMX-SSE-AVX** instructions as infix math (`xor eax, ebx → eax = eax ^ ebx`). |
+| 💬 | **libc annotations** | A one-line *what-it-does* note on every recognised libc function (`fopen → open a file, returns FILE*`), shown at call sites in the decompiler. |
+| 🧩 | **Decompiler annotations (with real args)** | In the **pseudocode** of the current function, annotates **libc calls** and **MMX/SSE intrinsics** using the **actual arguments**: `sleep(10) → sleep 10 sec`, `fopen("flag","rb") → open "flag" (mode "rb")`, `_m_psrlwi(x,8) → >> per 16b`. |
+| 🌐 | **Bilingual (EN / 中文)** | One click switches **both** the panel UI and the annotation language. |
 | ↩️ | **One-click Undo** | Every name and comment a run changes is snapshotted and reversible. Your own names and comments are **never** overwritten. |
 | 📦 | **Single file, offline** | The detector *and* the entire fingerprint database live inside one `.py`. No pip installs, no network. |
 
@@ -54,7 +55,7 @@ database as names and comments, and lets you undo the whole thing if you don't l
 ```
 
 ```
-┌─ IDA Better Information ──────────────────────────────┐
+┌─ IDA Better Information ─────────────────  Lang:[EN▾] ┐
 │ type: linux / static                                  │
 │   glibc 2.39     22.2%  348/1566                      │
 │   glibc 2.40     17.4%  272/1566                      │
@@ -62,8 +63,8 @@ database as names and comments, and lets you undo the whole thing if you don't l
 │ verdict: glibc 2.39   confidence=high                 │
 │                                                       │
 │ [x] Apply matching FLIRT signature                    │
-│ [x] Annotate libc functions (keeps your comments)     │
-│ [ ] Annotate math in CURRENT function                 │
+│ [x] Annotate libc functions                           │
+│ [x] Annotate current function in the decompiler       │
 │                                                       │
 │   [ Re-detect ]   [ Run ]   [ Undo ]                  │
 └───────────────────────────────────────────────────────┘
@@ -128,29 +129,40 @@ runner-up**: a clear leader is a confident call. The tool reports `high` / `medi
 from that gap, not from the raw percentage — which is why `22.2%` above is still a confident
 `glibc 2.39`.
 
-### Math annotations
+### Decompiler annotations (with real arguments)
 
-Reading hand-written crypto in a CTF binary means reading SIMD. The plugin turns the raw
-mnemonics into the math you'd write on paper:
+You read the **decompiler**, so that is where the notes go. On the call lines of the current
+function, the plugin annotates two things right in the pseudocode.
 
-| Instruction | Comment it writes |
+**libc calls — using the actual arguments:**
+
+| Pseudocode call | Comment it writes |
 |---|---|
-| `xor eax, ebx` | `eax = eax ^ ebx` |
-| `xor eax, eax` | `eax = 0` |
-| `add rax, rcx` | `rax = rax + rcx` |
-| `shl edx, 4` | `edx = edx << 4` |
-| `ror r8, 1` | `r8 = r8 >>>(rot) 1` |
-| `lea rax, [rbx+rcx*4]` | `rax = &[rbx+rcx*4]` |
-| `pxor mm0, mm1` | `mm0 = mm0 ^ mm1` |
-| `psrlw mm0, 8` | `mm0 = mm0 >> 8 (per 16b)` |
-| `psllw mm1, 8` | `mm1 = mm1 << 8 (per 16b)` |
-| `paddb mm0, mm2` | `mm0 = mm0 + mm2 (per byte)` |
-| `vpxor xmm0, xmm1, xmm2` | `xmm0 = xmm1 ^ xmm2` |
+| `sleep(10)` | `libc: sleep 10 sec` |
+| `fopen("flag.txt", "rb")` | `libc: open "flag.txt" (mode "rb")` |
+| `malloc(n7 + 8)` | `libc: alloc n7 + 8 bytes` |
+| `memcpy(dst, src, 32)` | `libc: copy 32 bytes src -> dst` |
+| `read(0, buf, 64)` | `libc: read 64 bytes from fd 0` |
 
-Covers `add sub and or xor imul shl/sal shr sar rol ror adc sbb not neg inc dec lea`,
-the MMX/SSE family `pxor pand por pandn padd* psub* pmul* psll* psrl* psra*`, scalar float
-`add/sub/mul/div ss/sd`, and their AVX 3-operand `v`-prefixed forms. It annotates the function
-your cursor is in, so you opt in per function instead of flooding the whole database.
+**MMX / SSE intrinsics — the math meaning:**
+
+| Pseudocode | Comment |
+|---|---|
+| `_m_pxor(a, b)` | `op: ^ (xor)` |
+| `_m_psrlwi(x, 8)` | `op: >> per 16b` |
+| `_m_psllqi(x, 1)` | `op: << whole 64b` |
+| `_m_paddb(a, b)` | `op: + per byte` |
+
+Arguments are read straight from the Hex-Rays ctree, so constants, strings and variable names
+all render. It annotates only the function your cursor is in — you opt in per function. (A
+separate disassembly-level mode, `xor eax, ebx → eax = eax ^ ebx`, also exists for people who
+read the raw listing; it covers the integer and vector mnemonics plus their AVX `v`-prefixed
+forms.)
+
+### Language
+
+A dropdown in the panel switches between **English** and **中文**. It changes the UI *and* the
+text of every annotation, and the choice is remembered across sessions.
 
 ## FLIRT signatures
 

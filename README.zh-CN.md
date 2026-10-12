@@ -37,8 +37,9 @@
 |---|---|---|
 | 🔎 | **运行库 / 编译器识别** | 目标用的 glibc/musl 精确构建 —— **stripped + 静态链接也能认**,另支持 Go 和 MSVC 版本。 |
 | 🏷️ | **FLIRT 自动套用** | 自动套上匹配的 `glibc_*` / `musl_*` 签名,库函数名字全回来。 |
-| 💬 | **libc 用途注释** | 给每个识别出的 libc 函数加一行"干什么的"(`fopen → 打开文件,返回 FILE*`)。 |
-| ➗ | **数学表达式注释** | 把算术 / 逻辑 / **MMX-SSE-AVX** 指令改写成中缀数学式(`xor eax, ebx → eax = eax ^ ebx`)。 |
+| 💬 | **libc 用途注释** | 给每个识别出的 libc 函数加一行"干什么的"(`fopen → 打开文件,返回 FILE*`),反编译里在调用处可见。 |
+| 🧩 | **反编译注释(带实参)** | 在当前函数的**伪代码**里,给**库函数调用**和 **MMX/SSE 指令**加注释,而且**用真实参数**:`sleep(10) → 睡眠 10 秒`、`fopen("flag","rb") → 打开 "flag"(模式 "rb")`、`_m_psrlwi(x,8) → 每16位 右移 >>`。 |
+| 🌐 | **中英双语** | 一键切换,**UI 和注释文字一起变**。 |
 | ↩️ | **一键撤回** | 本次运行改过的每个名字和注释都有快照、可逆。**绝不覆盖**你自己写的名字和注释。 |
 | 📦 | **单文件、离线** | 检测器**和整个指纹库**都在一个 `.py` 里。不用 pip、不联网。 |
 
@@ -51,7 +52,7 @@
 ```
 
 ```
-┌─ IDA Better Information ──────────────────────────────┐
+┌─ IDA Better Information ─────────────────  语言:[中文▾] ┐
 │ type: linux / static                                  │
 │   glibc 2.39     22.2%  348/1566                      │
 │   glibc 2.40     17.4%  272/1566                      │
@@ -59,10 +60,10 @@
 │ verdict: glibc 2.39   confidence=high                 │
 │                                                       │
 │ [x] 套用匹配的 FLIRT 签名                              │
-│ [x] 给 libc 函数加注释(保留你的注释)                 │
-│ [ ] 给当前函数的指令加数学表达式                       │
+│ [x] 给 libc 函数加注释                                 │
+│ [x] 给当前函数写反编译注释(带实参)                   │
 │                                                       │
-│   [ Re-detect ]   [ Run ]   [ Undo ]                  │
+│   [ 重新检测 ]   [ 执行 ]   [ 撤回 ]                    │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -108,31 +109,39 @@ $ python ida_better_information.py ./target --static --top 8
 关键是**比第二名领先多少**:领先明显就是可信的判断。工具给出的 `high` / `medium` / `low`
 来自这个差距,而不是裸百分比 —— 这就是为什么上面 `22.2%` 依然是一个可信的 `glibc 2.39`。
 
-### 数学表达式注释
+### 反编译注释(带实参)
 
-CTF 里读手写加密往往就是读 SIMD。插件把裸助记符翻译成你会写在草稿纸上的式子:
+你读的是**反编译**,注释就写在那里。在当前函数的伪代码里,插件在调用行上注释两类东西。
 
-| 指令 | 写入的注释 |
+**库函数调用——用真实参数:**
+
+| 伪代码调用 | 写入的注释 |
 |---|---|
-| `xor eax, ebx` | `eax = eax ^ ebx` |
-| `xor eax, eax` | `eax = 0` |
-| `add rax, rcx` | `rax = rax + rcx` |
-| `shl edx, 4` | `edx = edx << 4` |
-| `ror r8, 1` | `r8 = r8 >>>(rot) 1` |
-| `lea rax, [rbx+rcx*4]` | `rax = &[rbx+rcx*4]` |
-| `pxor mm0, mm1` | `mm0 = mm0 ^ mm1` |
-| `psrlw mm0, 8` | `mm0 = mm0 >> 8 (per 16b)` |
-| `psllw mm1, 8` | `mm1 = mm1 << 8 (per 16b)` |
-| `paddb mm0, mm2` | `mm0 = mm0 + mm2 (per byte)` |
-| `vpxor xmm0, xmm1, xmm2` | `xmm0 = xmm1 ^ xmm2` |
+| `sleep(10)` | `libc: 睡眠 10 秒` |
+| `fopen("flag.txt", "rb")` | `libc: 打开 "flag.txt"(模式 "rb")` |
+| `malloc(n7 + 8)` | `libc: 分配 n7 + 8 字节` |
+| `memcpy(dst, src, 32)` | `libc: 复制 32 字节 src -> dst` |
+| `read(0, buf, 64)` | `libc: 从 fd 0 读 64 字节` |
 
-覆盖 `add sub and or xor imul shl/sal shr sar rol ror adc sbb not neg inc dec lea`、
-MMX/SSE 家族 `pxor pand por pandn padd* psub* pmul* psll* psrl* psra*`、标量浮点
-`add/sub/mul/div ss/sd`,以及它们带 `v` 前缀的 AVX 三操作数形式。它只注释**光标所在的那个函数**,
-按函数自愿开启,不会把整个库铺满注释。
+**MMX / SSE 内建函数——数学含义:**
+
+| 伪代码 | 注释 |
+|---|---|
+| `_m_pxor(a, b)` | `op: 异或 ^` |
+| `_m_psrlwi(x, 8)` | `op: 每16位 右移 >>` |
+| `_m_psllqi(x, 1)` | `op: 整块64位 左移 <<` |
+| `_m_paddb(a, b)` | `op: 每字节 相加 +` |
+
+参数直接从 Hex-Rays 的 ctree 里读,常量、字符串、变量名都能渲染。只注释**光标所在的那个函数**,
+按函数自愿开启。(另有一个汇编级模式 `xor eax, ebx → eax = eax ^ ebx`,给习惯看反汇编的人用,
+覆盖整数/向量助记符及其 AVX `v` 前缀形式。)
 
 > 这正是当初做这个功能的起因:有道题(强网杯 Butterfly)的加密核心全是 MMX,
-> `psrlw`/`psllw`/`psllq` 看得人头大 —— 标成数学式之后,"换字节 + 循环移位 + 逐字节加" 一眼就清楚了。
+> `psrlw`/`psllw`/`psllq` 看得人头大 —— 标成这样之后,"换字节 + 循环移位 + 逐字节加" 一眼就清楚了。
+
+### 语言
+
+面板上有个下拉框在 **English** 和 **中文** 之间切换,**UI 和每条注释的文字一起变**,选择会被记住。
 
 ## FLIRT 签名
 
