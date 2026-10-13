@@ -18,7 +18,7 @@ usage:
                            [--family glibc,musl] [--out db] [--cache _cache]
   python tools/build-db.py --corpus --cache _cache      # only fetch + extract (oldest rev)
 
-Then: python tools/build-fingerprint.py db tools/fingerprint.json
+Then: python tools/build-fingerprint.py _db tools/fingerprint.json
 """
 import argparse, io, os, re, subprocess, sys, tarfile, time, urllib.request
 
@@ -179,7 +179,7 @@ def main():
     ap.add_argument("--family", default="glibc,musl")
     ap.add_argument("--versions", default="", help="comma list to restrict versions")
     ap.add_argument("--pelf", default=os.environ.get("FLAIR_PELF", ""))
-    ap.add_argument("--out", default="db")
+    ap.add_argument("--out", default="_db")
     ap.add_argument("--cache", default="_cache")
     ap.add_argument("--corpus", action="store_true", help="fetch the OLDEST revision, extract only (no pelf)")
     args = ap.parse_args()

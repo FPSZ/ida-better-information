@@ -10,3 +10,5 @@ tools/fingerprint.json
 *.id2
 *.nam
 *.til
+_sigs/
+_sigs_build.log

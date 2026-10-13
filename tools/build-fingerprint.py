@@ -11,9 +11,16 @@ Two outputs:
   fingerprint.bin   compact form that gets embedded in the plugin (see _decode_fp in
                     the plugin): anchors stored once per arch, versions as varint deltas.
 
-usage: python tools/build-fingerprint.py [db_dir] [out.json]
+Bytes the linker fills in or rewrites (TLS IE->LE, relocated AArch64 words; see flair_relax.py) are
+wildcarded first, so anchors never span them.
+
+usage: python tools/build-fingerprint.py [db_dir] [out.json] [--no-relax-tls] [--no-relax-got]
 """
 import glob, json, os, struct, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import flair_relax
+_LIBC_GLOB = {"x86_64": "libc6-dev_*_amd64", "i386": "libc6-dev-i386_*_amd64", "aarch64": "libc6-dev_*_arm64"}
 
 MIN_RUN = 10    # shortest anchor kept
 MAX_ANCH = 24   # anchors are truncated to this many bytes
@@ -35,11 +42,15 @@ def longest_literal_run(tok):
     return best[:MAX_ANCH]
 
 
-def anchors_from_pat(path):
+def anchors_from_pat(path, tls=None, arch=None, relocs=False):
     out = set()
     with open(path, "r", errors="ignore") as f:
         for line in f:
             line = line.strip()
+            if tls:                      # wildcard bytes the linker rewrites (TLS relaxation)
+                line = flair_relax.relax_line(line, tls, arch)[0]
+            if relocs:                   # ... and GOT-indirect -> direct relaxation
+                line = flair_relax.relax_relocs(line, arch)[0]
             if not line or line.startswith("---"):
                 continue
             tok = line.split(" ", 1)[0]
@@ -95,16 +106,23 @@ def encode_bin(arches):
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    db = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "..", "_db")
-    out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(here, "fingerprint.json")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    db = args[0] if len(args) > 0 else os.path.join(here, "..", "_db")
+    out = args[1] if len(args) > 1 else os.path.join(here, "fingerprint.json")
+    relax = "--no-relax-tls" not in sys.argv
+    relocs = "--no-relax-got" not in sys.argv
+    cache = os.path.join(os.path.dirname(os.path.abspath(db)), "_cache")
     arches = {}
     for arch_dir in sorted(glob.glob(os.path.join(db, "*"))):
         if not os.path.isdir(arch_dir):
             continue
         arch = os.path.basename(arch_dir)
+        tls = None
+        if relax and arch in _LIBC_GLOB:
+            tls = flair_relax.tls_names(glob.glob(os.path.join(cache, "x", _LIBC_GLOB[arch], "libc.a")))
         for p in sorted(glob.glob(os.path.join(arch_dir, "*.pat"))):
             key = os.path.splitext(os.path.basename(p))[0]
-            a = anchors_from_pat(p)
+            a = anchors_from_pat(p, tls, arch, relocs)
             if a:
                 arches.setdefault(arch, {})[key] = a
         if arch in arches:

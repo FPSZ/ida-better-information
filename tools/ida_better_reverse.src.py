@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IDA Better Information — know your binary before you read a single line.
+IDA Better Reverse — know your binary before you read a single line.
 
 A single-file IDA Pro plugin (and standalone CLI) that enriches a disassembly with
 the context you normally have to dig for by hand:
@@ -24,17 +24,17 @@ the context you normally have to dig for by hand:
 
 The detector and the entire fingerprint database are embedded in THIS single file.
   - In IDA:   drop it into the `plugins/` directory and press Ctrl-Alt-G.
-  - As a CLI: `python ida_better_information.py <binary>`.
+  - As a CLI: `python ida_better_reverse.py <binary>`.
 
 Your existing names and comments are never clobbered, and every change made in a run
 can be reverted with one click (Undo).
 
-Repo:    https://github.com/FPSZ/ida-better-information
+Repo:    https://github.com/FPSZ/ida-better-reverse
 License: MIT
 """
 import os, re, sys, json, gzip, base64, struct, argparse
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # ======================================================================
 #  Embedded fingerprint database  (gzip + base64 of fingerprint.bin)
@@ -99,8 +99,17 @@ def _load_fp():
     return _FP_CACHE
 
 
+# Each anchor (10..24 bytes) is indexed by its *rarest* 8-byte window rather than its
+# prefix. Anchors start in function prologues, so prefixes collide massively (x86_64:
+# 12k anchors -> 4.5k distinct 8-byte prefixes, largest bucket 1124 anchors, all hit
+# at every function entry). Keying on the window least shared with other anchors
+# gives ~11.6k distinct keys, largest bucket 7, and ~300x less verification work.
+_Q = 8
+
+
 def _arch_db(arch):
-    """Return (prefix_index, {key:set(idx)}) for an arch, or (None, None)."""
+    """Return (index, {key:set(idx)}) for an arch, or (None, None).
+       index maps an 8-byte key to [(anchor_id, anchor_bytes, key_offset_in_anchor)]."""
     if arch in _ARCH_CACHE:
         return _ARCH_CACHE[arch]
     fp = _load_fp().get(arch)
@@ -108,9 +117,15 @@ def _arch_db(arch):
         _ARCH_CACHE[arch] = (None, None)
         return None, None
     table = fp["table"]
+    freq = {}
+    for a in table:
+        for j in range(len(a) - _Q + 1):
+            w = a[j:j + _Q]
+            freq[w] = freq.get(w, 0) + 1
     index = {}
     for i, a in enumerate(table):
-        index.setdefault(a[:4], []).append((i, a))
+        j = min(range(len(a) - _Q + 1), key=lambda j: (freq[a[j:j + _Q]], -j))
+        index.setdefault(a[j:j + _Q], []).append((i, a, j))
     vers = {k: set(v) for k, v in fp["vers"].items()}
     _ARCH_CACHE[arch] = (index, vers)
     return index, vers
@@ -126,18 +141,21 @@ def _lib_label(key):
 #  Scanning — find which anchors are present in a byte buffer
 # ======================================================================
 def _scan_window(window, index, present):
-    """Record ids of anchors occurring anywhere in a short window."""
+    """Record ids of anchors occurring anywhere in window."""
     get = index.get
-    n = len(window)
-    for pos in range(max(0, n - 3)):
-        for i, a in get(window[pos:pos + 4], ()):
-            if i not in present and window[pos:pos + len(a)] == a:
-                present.add(i)
+    for p in range(len(window) - _Q + 1):
+        bucket = get(window[p:p + _Q])
+        if bucket:
+            for i, a, j in bucket:
+                s = p - j
+                if i not in present and s >= 0 and window[s:s + len(a)] == a:
+                    present.add(i)
 
 
 def _present_in_buffer(buf, index):
     present = set()
-    _scan_window(buf, index, present)
+    if buf and index is not None:
+        _scan_window(buf, index, present)
     return present
 
 
@@ -156,18 +174,41 @@ def _score(present, vers, top):
 #  ELF parsing
 # ======================================================================
 EM_TO_ARCH = {3: "i386", 62: "x86_64", 183: "aarch64", 40: "arm",
-              8: "mips", 10: "mips", 21: "ppc", 22: "ppc64", 243: "riscv",
-              0xB7: "aarch64", 0x3E: "x86_64"}
+              8: "mips", 10: "mips", 21: "ppc", 22: "ppc64", 243: "riscv"}
+_ARCH_BITS = {"x86_64": 64, "aarch64": 64, "ppc64": 64, "i386": 32, "arm": 32, "ppc": 32}
+
+
+def _elf_layout(data):
+    """Return (is64, endian, tamper_note). The kernel loads x86/ARM ELFs without
+       trusting EI_CLASS/EI_DATA, so CTF binaries rewrite those ident bytes to break
+       file(1), readelf and disassemblers. If the declared layout yields no known
+       machine but the other byte order does, trust the header fields instead."""
+    is64 = data[4] == 2
+    en = "<" if data[5] == 1 else ">"
+    ok = lambda e: (EM_TO_ARCH.get(struct.unpack_from(e + "H", data, 18)[0]),
+                    struct.unpack_from(e + "H", data, 16)[0] in (1, 2, 3, 4))
+    arch, typ_ok = ok(en)
+    if arch and typ_ok:
+        return is64, en, None
+    for e in ("<", ">"):
+        arch, typ_ok = ok(e)
+        if arch and typ_ok:
+            bits = _ARCH_BITS.get(arch, 64 if is64 else 32)
+            note = ("ELF ident bytes tampered: EI_CLASS/EI_DATA claim %d-bit %s-endian, "
+                    "header decodes as %d-bit %s-endian %s"
+                    % (64 if is64 else 32, "little" if en == "<" else "big",
+                       bits, "little" if e == "<" else "big", arch))
+            return bits == 64, e, note
+    return is64, en, None
 
 
 def _parse_elf_headers(data):
     """Return dict with arch, class, interp, needed count, exec byte ranges."""
     r = {"arch": None, "bits": None, "etype": None, "interp": None,
-         "needed": 0, "exec_ranges": [], "machine": None}
+         "needed": 0, "exec_ranges": [], "machine": None, "tampered": None}
     if len(data) < 64 or data[:4] != b"\x7fELF":
         return r
-    is64 = data[4] == 2
-    en = "<" if data[5] == 1 else ">"
+    is64, en, r["tampered"] = _elf_layout(data)
     r["bits"] = 64 if is64 else 32
     r["etype"] = struct.unpack_from(en + "H", data, 16)[0]
     machine = struct.unpack_from(en + "H", data, 18)[0]
@@ -345,6 +386,8 @@ def detect_elf(data, arch_hint=None, force=None, top=5, present_hook=None):
     hdr = _parse_elf_headers(data)
     r["arch"] = arch_hint or hdr["arch"]
     r["toolchain"] = _comment_toolchain(data)
+    if hdr["tampered"]:
+        r["notes"].append(hdr["tampered"] + ".")
 
     m = re.search(rb"\x04\x00\x00\x00\x14\x00\x00\x00\x03\x00\x00\x00GNU\x00(.{20})", data, re.S)
     if m:
@@ -405,14 +448,14 @@ def detect_elf(data, arch_hint=None, force=None, top=5, present_hook=None):
         return r
     index, vers = _arch_db(r["arch"])
     if present_hook is not None:
-        present = present_hook(index)               # IDA: scan function starts
+        present = present_hook(index)               # IDA: scan the loaded image
     else:
         present = set()
         if hdr["exec_ranges"]:
             for off, sz in hdr["exec_ranges"]:
-                _scan_window(data[off:off + sz], index, present)
+                present |= _present_in_buffer(data[off:off + sz], index)
         else:
-            _scan_window(data, index, present)
+            present = _present_in_buffer(data, index)
     ranking, scored = _score(present, vers, top)
     r["ranking"] = [(v, round(s, 3), h, n) for (v, s, h, n) in ranking]
     if scored:
@@ -433,9 +476,15 @@ def detect_elf(data, arch_hint=None, force=None, top=5, present_hook=None):
         if hint and not bestver.startswith("musl"):
             agree = "agrees" if hint == bestver else "cf. toolchain ~%s" % hint
             r["notes"].append("toolchain cross-check: %s." % agree)
+        # an explicit Ubuntu release tag in .comment is independent evidence; when it
+        # names the same glibc as the fingerprint leader, a narrow lead is still trusted
+        tagged = r["toolchain"] and any(t in r["toolchain"] for t, _ in _UBUNTU_GLIBC)
         if bests < 0.05:
             r["confidence"] = "low"
             r["notes"].append("hit-rate very low: build may be outside the DB.")
+        elif r["confidence"] == "low" and tagged and hint == bestver:
+            r["confidence"] = "medium"
+            r["notes"].append("narrow lead, raised to medium: the Ubuntu toolchain tag names the same glibc.")
         elif r["confidence"] == "low":
             r["notes"].append("top candidates are close; try FLIRT for each.")
     return r
@@ -487,7 +536,7 @@ def detect(path=None, data=None, force=None, top=5, arch_hint=None, present_hook
 # ======================================================================
 def _cli():
     ap = argparse.ArgumentParser(
-        prog="ida_better_information.py",
+        prog="ida_better_reverse.py",
         description="Detect the C runtime / compiler of a binary (glibc, musl, Go, Rust, MSVC).")
     ap.add_argument("binary", nargs="?", help="target ELF/PE file")
     ap.add_argument("--static", action="store_true", help="force static analysis")
@@ -497,7 +546,7 @@ def _cli():
     ap.add_argument("--json", action="store_true", help="emit the raw result as JSON")
     args = ap.parse_args()
     if not args.binary:
-        print("IDA Better Information v%s" % __version__)
+        print("IDA Better Reverse v%s" % __version__)
         ap.print_help(); sys.exit(1)
     force = "static" if args.static else ("dynamic" if args.dynamic else None)
     r = detect(path=args.binary, force=force, top=args.top, arch_hint=args.arch)
@@ -532,8 +581,14 @@ def canon(name):
     n = re.sub(r'^isoc\d+_', '', n)          # __isoc99_scanf / __isoc23_strtol
     n = re.sub(r'_chk$', '', n); n = re.sub(r'_unlocked$', '', n)
     n = re.sub(r'^IO_', '', n); n = re.sub(r'^new_', '', n)
-    n = re.sub(r'^libc_', '', n); n = re.sub(r'_internal$', '', n); n = re.sub(r'64$', '', n)
-    return n
+    n = re.sub(r'^libc_', '', n); n = re.sub(r'_internal$', '', n)
+    n = re.sub(r'_nocancel$', '', n)         # __read_nocancel / __open_nocancel in static glibc
+    n = re.sub(r'64$', '', n)
+    return _ALIASES.get(n, n)
+
+
+# glibc names the signal() implementation __bsd_signal and exports it under aliases
+_ALIASES = {"bsd_signal": "signal", "ssignal": "signal", "sysv_signal": "signal"}
 
 
 # __*_chk and friends carry extra leading/trailing args; map to (base, kept-arg-indices).
@@ -679,6 +734,7 @@ if _IN_IDA:
     TMPL = {
      "sleep":("sleep {0} sec","睡眠 {0} 秒"), "usleep":("sleep {0} us","睡眠 {0} 微秒"),
      "nanosleep":("high-res sleep","高精度睡眠"), "alarm":("SIGALRM in {0}s","{0} 秒后 SIGALRM"),
+     "setvbuf":("{0} buffering: {2}","{0} 缓冲方式:{2}"),
      "fopen":("open {0} (mode {1})","打开 {0}(模式 {1})"),
      "freopen":("reopen {0} (mode {1})","重开 {0}(模式 {1})"),
      "open":("open {0} ({1})","打开 {0}({1})"), "openat":("openat {1} ({2})","相对打开 {1}({2})"),
@@ -781,6 +837,7 @@ if _IN_IDA:
         "signal": {0: _lut(_SIG)}, "sigaction": {0: _lut(_SIG)},
         "ptrace": {0: _lut(_PTRACE)}, "prctl": {0: _lut(_PRCTL)},
         "socket": {0: _lut(_AF), 1: _lut(_SOCK)},
+        "setvbuf": {2: _lut({0: "_IOFBF (full)", 1: "_IOLBF (line)", 2: "_IONBF (unbuffered)"})},
         "access": {1: lambda v: _bits(v, _ACCESS)},
     }
     # functions whose first fd arg reads nicely as stdin/stdout/stderr
@@ -879,18 +936,22 @@ if _IN_IDA:
     # ---------- language, persisted ----------
     try:
         import ida_diskio
-        _CFG = os.path.join(ida_diskio.get_user_idadir(), "ida_better_information.cfg")
+        _CFG = os.path.join(ida_diskio.get_user_idadir(), "ida_better_reverse.cfg")
     except Exception:
-        _CFG = os.path.join(os.path.expanduser("~"), ".ida_better_information.cfg")
+        _CFG = os.path.join(os.path.expanduser("~"), ".ida_better_reverse.cfg")
     LANG = "en"
 
     def _load_lang():
         global LANG
-        try:
-            v = json.load(open(_CFG)).get("lang", "en")
-            LANG = v if v in ("en", "zh") else "en"
-        except Exception:
-            LANG = "en"
+        LANG = "en"
+        # pre-rename installs saved their setting as ida_better_information.cfg
+        for cfg in (_CFG, _CFG.replace("better_reverse", "better_information")):
+            try:
+                v = json.load(open(cfg)).get("lang", "en")
+                LANG = v if v in ("en", "zh") else "en"
+                return
+            except Exception:
+                continue
 
     def _save_lang():
         try:
@@ -903,7 +964,7 @@ if _IN_IDA:
         return zh if LANG == "zh" else en
 
     # undo snapshots: names + function comments + insn comments + pseudocode comments
-    _undo = {"names": {}, "cmts": {}, "icmts": {}, "pcmts": []}
+    _undo = {"names": {}, "cmts": {}, "icmts": {}, "pcmts": [], "types": [], "libflag": set()}
 
     def _cur_arch():
         try:
@@ -926,7 +987,11 @@ if _IN_IDA:
 
     # ---------- detection using the IDB, not the on-disk file ----------
     def _ida_present_hook(index):
-        """Scan the first 32 bytes of every function for anchors (fast, IDB-local)."""
+        """Scan the loaded executable segments for anchors (IDB-local).
+           Falls back to per-function windows if the image can't be read in bulk."""
+        buf = _ida_image_bytes()
+        if buf:
+            return _present_in_buffer(buf, index)
         present = set()
         for ea in idautils.Functions():
             w = ida_bytes.get_bytes(ea, 32)
@@ -935,13 +1000,13 @@ if _IN_IDA:
         return present
 
     def _ida_image_bytes():
-        """Concatenate the executable segments for packer/string heuristics."""
+        """Concatenate the executable segments (for fingerprinting and packer heuristics)."""
         import ida_segment
         chunks = []
         seg = ida_segment.get_first_seg()
         while seg is not None:
             if seg.perm & ida_segment.SEGPERM_EXEC:
-                b = ida_bytes.get_bytes(seg.start_ea, min(seg.size(), 8 << 20))
+                b = ida_bytes.get_bytes(seg.start_ea, min(seg.size(), 64 << 20))
                 if b:
                     chunks.append(b)
             seg = ida_segment.get_next_seg(seg.start_ea)
@@ -971,30 +1036,40 @@ if _IN_IDA:
             return ""
         conf = {"high": T("high", "高"), "medium": T("medium", "中"),
                 "low": T("low", "低")}.get(r.get("confidence"), r.get("confidence"))
-        lines = [T("type", "类型") + ": %s / %s / %s" % (r.get("os"), r.get("kind"), r.get("arch") or "?")]
-        if r.get("build_id"):
-            lines.append("build-id: %s" % r["build_id"])
+        # verdict first: it is the line the user opened the panel for
+        lines = ["%s   [%s %s]" % (r.get("best"), T("confidence", "置信度"), conf),
+                 "%s / %s / %s" % (r.get("os"), r.get("kind"), r.get("arch") or "?")]
         for v, s, h, n in r.get("ranking", []):
             lines.append("  %-12s %5.1f%%  %d/%d" % (_lib_label(v), s * 100, h, n))
-        lines.append(T("verdict", "结论") + ": %s   " % r.get("best") + T("confidence", "置信度") + "=%s" % conf)
         for note in r.get("notes", []):
             lines.append("  . " + note)
+        if r.get("build_id"):
+            lines.append("build-id: %s" % r["build_id"])
         return "\n".join(lines)
 
     # ---------- FLIRT ----------
-    def _sig_dirs():
+    # FLIRT signatures are keyed by directory, not by the .sig processor byte:
+    # x86 (i386 + x86_64) live in sig/pc, ARM/AArch64 in sig/arm.
+    _SIG_SUBDIR = {"x86_64": "pc", "i386": "pc", "aarch64": "arm", "arm": "arm"}
+    # per-arch filename markers, most-preferred first
+    _ARCH_MARK = {"x86_64": ("amd64", "a64", "x64"), "i386": ("i386", "a32"),
+                  "aarch64": ("aarch64", "arm64", "arm"), "arm": ("arm32", "arm")}
+
+    def _sig_dirs(arch):
+        sub = _SIG_SUBDIR.get(arch, "pc")
         out = []
         for base in (getattr(idaapi, "get_user_idadir", lambda: None)(), idaapi.idadir("")):
             if not base:
                 continue
-            d = os.path.join(base, "sig", "pc")
-            if os.path.isdir(d):
+            d = os.path.join(base, "sig", sub)
+            if os.path.isdir(d) and d not in out:
                 out.append(d)
         return out
 
-    def _find_sigs(verstr):
+    def _find_sigs(verstr, arch):
+        marks = _ARCH_MARK.get(arch, ())
         out = []
-        for sigdir in _sig_dirs():
+        for sigdir in _sig_dirs(arch):
             try:
                 for fn in os.listdir(sigdir):
                     low = fn.lower()
@@ -1002,8 +1077,14 @@ if _IN_IDA:
                         out.append(fn)
             except Exception:
                 pass
-        out = sorted(set(out), key=lambda s: (("amd64" not in s and "a64" not in s and "x64" not in s), s))
-        return out
+
+        def rank(s):
+            low = s.lower()
+            for i, m in enumerate(marks):
+                if m in low:
+                    return (0, i, s)
+            return (1, 0, s)                 # no arch marker: lowest priority
+        return sorted(set(out), key=rank)
 
     def _ensure_libc_til():
         """Load the gnulnx_x64 type library so named libc funcs get real prototypes."""
@@ -1011,22 +1092,79 @@ if _IN_IDA:
             import ida_typeinf
             til = ida_typeinf.get_idati()
             names = [til.base(i).name for i in range(til.nbases)]
-            want = "gnulnx_x64" if (_cur_arch() == "x86_64") else "gnuunx"
+            want = {"x86_64": "gnulnx_x64", "i386": "gnulnx_x86",
+                    "aarch64": "gnulnx_arm64", "arm": "gnulnx_arm"}.get(_cur_arch(), "gnuunx")
             if not any(want in n for n in names):
                 ida_typeinf.add_til(want, ida_typeinf.ADDTIL_DEFAULT)
         except Exception:
             pass
 
+    def _apply_prototypes():
+        """Give FLIRT-named libc functions their real prototype from the type library.
+           Without it Hex-Rays guesses the arity (mmap shows up as mmap64(0)), and the
+           argument decoding has nothing to work with. User-set types are left alone."""
+        try:
+            import ida_typeinf, ida_nalt
+        except Exception:
+            return 0
+        til = ida_typeinf.get_idati()
+
+        def lookup(sym):
+            # prototypes live in the til's *symbol* table, C names with a leading '_'
+            for key in ("_" + sym, sym):
+                r = ida_typeinf.get_named_type(til, key, ida_typeinf.NTF_SYMM)
+                if r:
+                    t = ida_typeinf.tinfo_t()
+                    if t.deserialize(til, r[1], r[2]) and t.is_func():
+                        return t
+            return None
+
+        n = 0
+        for ea in idautils.Functions():
+            name = ida_funcs.get_func_name(ea) or ""
+            if _is_dummy_name(name) or ida_nalt.is_userti(ea):
+                continue
+            tif = None
+            cands = [name.lstrip("_"), name]
+            if not name.endswith("_chk"):     # a fortified variant must not get its base's prototype
+                cands.insert(0, canon(name))
+            for cand in dict.fromkeys(cands):
+                tif = lookup(cand) if cand else None
+                if tif:
+                    break
+            if tif is None:
+                continue
+            if ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
+                n += 1
+        return n
+
+    def _type_snapshot():
+        """{ea: tinfo copy} for every function that has a stored type."""
+        import ida_typeinf, ida_nalt
+        snap = {}
+        for ea in idautils.Functions():
+            t = ida_typeinf.tinfo_t()
+            if ida_nalt.get_tinfo(t, ea):
+                snap[ea] = t
+        return snap
+
+    # IDA's placeholder names: FLIRT's "library code, name unknown" and plain auto-names
+    _AUTONAME = re.compile(r"^(?:sub|nullsub|j_sub|unknown_libname)_[0-9A-Fa-f]+$")
+
     def _apply_one_sig(signame):
-        before = {ea: (ida_funcs.get_func_name(ea) or "") for ea in idautils.Functions()}
+        before = {ea: (ida_funcs.get_func_name(ea) or "",
+                       bool(ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB)) for ea in idautils.Functions()}
         idaapi.plan_to_apply_idasgn(signame)
         ida_auto.auto_wait()
         changed = 0
         for ea in idautils.Functions():
             nm = ida_funcs.get_func_name(ea) or ""
-            if before.get(ea, "") != nm:
-                _undo["names"].setdefault(ea, before.get(ea, ""))
-                changed += 1
+            old_nm, old_lib = before.get(ea, ("", False))
+            if old_nm != nm:
+                _undo["names"].setdefault(ea, old_nm)
+                changed += not _AUTONAME.match(nm)
+            if not old_lib and ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB:
+                _undo["libflag"].add(ea)       # FLIRT marks matches as library functions
         return changed
 
     def do_apply_sig(r):
@@ -1038,11 +1176,13 @@ if _IN_IDA:
         # let FLIRT keep only byte-matching functions.
         cands = [v for v, s, h, n in r["ranking"]]
         cands = cands[:1] if r.get("confidence") == "high" else cands[:3]
+        arch = r.get("arch")
         _ensure_libc_til()
+        types_before = _type_snapshot()   # FLIRT itself makes IDA apply some types too
         applied, total_changed = [], 0
         for ver in cands:
             verstr = _lib_label(ver).replace("glibc", "").replace("musl", "").strip().lstrip(">=")
-            sigs = _find_sigs(verstr)
+            sigs = _find_sigs(verstr, arch)
             if not sigs:
                 continue
             signame = os.path.splitext(sigs[0])[0]
@@ -1051,9 +1191,16 @@ if _IN_IDA:
         if not applied:
             return T("no FLIRT .sig for %s in IDA sig/pc. Generate one with FLAIR or grab a community set.",
                      "IDA sig/pc 里没有 %s 的签名。用 FLAIR 生成或从社区签名集拿。") % best
-        named = sum(1 for ea in idautils.Functions() if not (ida_funcs.get_func_name(ea) or "").startswith("sub_"))
-        return T("applied %s; named %d this run; %d non-sub_ funcs total.",
-                 "已套用 %s;本次命名 %d 个,当前非 sub_ 函数共 %d 个。") % (", ".join(applied), total_changed, named)
+        typed = _apply_prototypes()
+        types_after = _type_snapshot()
+        for ea in set(types_before) | set(types_after):
+            b, a = types_before.get(ea), types_after.get(ea)
+            if (str(b) if b is not None else None) != (str(a) if a is not None else None):
+                _undo["types"].append((ea, b))   # b None -> the function had no type before
+        named = sum(1 for ea in idautils.Functions() if not _AUTONAME.match(ida_funcs.get_func_name(ea) or ""))
+        return T("applied %s; named %d functions this run (%d named in total); %d prototypes applied.",
+                 "已套用 %s;本次命名 %d 个函数(共 %d 个有名字);套用原型 %d 个。") % (
+                     ", ".join(applied), total_changed, named, typed)
 
     # ---------- libc function comments ----------
     def annotate_all():
@@ -1099,6 +1246,9 @@ if _IN_IDA:
 
     def _str_at(ea):
         """Return a quoted C-string at ea (typed, or raw printable bytes), else None."""
+        f = ida_bytes.get_flags(ea)
+        if ida_bytes.is_data(f) and not ida_bytes.is_byte(f) and not ida_bytes.is_strlit(f):
+            return None                       # a pointer/int variable (e.g. stdout), never text
         s = idc.get_strlit_contents(ea, -1, -1)
         if not s:
             raw = ida_bytes.get_bytes(ea, 24) or b""
@@ -1185,7 +1335,7 @@ if _IN_IDA:
             if iv is not None:
                 name = _syscalls(_cur_arch() or "x86_64").get(iv)
                 if name:
-                    return SYS + "%s(%s)" % (name, ", ".join(A[1:]))
+                    return SYS + "%s (#%d)" % (name, iv)   # extra args are Hex-Rays guesses (variadic)
         pair = TMPL.get(base)
         if pair:
             t = pair[1] if LANG == "zh" else pair[0]
@@ -1195,6 +1345,47 @@ if _IN_IDA:
                 pass
         d = (DESC_ZH if LANG == "zh" else DESC).get(base)
         return (PFX + d) if d else None
+
+    # segment-register reads Hex-Rays renders as __readfsqword(off) / __readgsdword(off)
+    _SEG_ELF = {("fs", 0x0): ("thread control block", "线程控制块 TCB"),
+                ("fs", 0x10): ("TCB self pointer", "TCB 自指针"),
+                ("fs", 0x28): ("stack canary", "栈 canary"),
+                ("fs", 0x30): ("pointer guard (PTR_MANGLE)", "指针保护值 (PTR_MANGLE)"),
+                ("gs", 0x0): ("thread control block", "线程控制块 TCB"),
+                ("gs", 0x14): ("stack canary", "栈 canary"),
+                ("gs", 0x18): ("pointer guard (PTR_MANGLE)", "指针保护值 (PTR_MANGLE)")}
+    _SEG_PE = {("gs", 0x30): ("TEB", "TEB"), ("gs", 0x60): ("PEB (IsDebuggerPresent / BeingDebugged)", "PEB（常用于反调试）"),
+               ("gs", 0x58): ("TLS array", "TLS 数组"), ("fs", 0x0): ("SEH chain", "SEH 链"),
+               ("fs", 0x18): ("TEB", "TEB"), ("fs", 0x2C): ("TLS array", "TLS 数组"),
+               ("fs", 0x30): ("PEB (IsDebuggerPresent / BeingDebugged)", "PEB（常用于反调试）")}
+
+    def _segread_note(helper, e):
+        m = re.match(r"__(read|write)(fs|gs)(byte|word|dword|qword)$", helper or "")
+        if not m:
+            return None
+        try:
+            off = _arg_int(e.a[0])
+        except Exception:
+            off = None
+        if off is None:
+            return None
+        seg = m.group(2)
+        signed =off - (1 << 32) if off >= 0x80000000 and off < (1 << 32) else \
+            off - (1 << 64) if off >= (1 << 63) else off
+        if signed < 0:
+            what = ("thread-local variable (e.g. errno)", "线程局部变量（如 errno）")
+        else:
+            try:
+                import ida_ida
+                pe = ida_ida.inf_get_filetype() == ida_ida.f_PE
+            except Exception:
+                pe = False
+            what = (_SEG_PE if pe else _SEG_ELF).get((seg, signed))
+            if not what:
+                return None
+        where = "%s:%s0x%X" % (seg, "-" if signed < 0 else "", abs(signed))
+        return OPX + "%s %s %s" % (T("read", "读") if m.group(1) == "read" else T("write", "写"),
+                                   where, what[1] if LANG == "zh" else what[0])
 
     def _magic_note(cfunc, e):
         """If any immediate arg is a known magic constant, note it."""
@@ -1226,7 +1417,7 @@ if _IN_IDA:
                 if e.op == hr.cot_call and e.x is not None and e.ea != idaapi.BADADDR:
                     got = []
                     if e.x.op == hr.cot_helper:
-                        n = _intrin_note(e.x.helper)
+                        n = _intrin_note(e.x.helper) or _segread_note(e.x.helper, e)
                         if n:
                             got.append(n)
                     elif e.x.op == hr.cot_obj:
@@ -1466,7 +1657,8 @@ if _IN_IDA:
         for ea, old in list(_undo["names"].items()):
             try:
                 if _is_dummy_name(old):
-                    ok = ida_name.set_name(ea, "", ida_name.SN_NOWARN | ida_name.SN_FORCE)
+                    # empty name = let IDA regenerate sub_XXXX; SN_FORCE makes this fail
+                    ok = ida_name.set_name(ea, "", ida_name.SN_NOWARN)
                 else:
                     ok = ida_name.set_name(ea, old, ida_name.SN_NOWARN | ida_name.SN_NOCHECK | ida_name.SN_FORCE)
                 if ok:
@@ -1502,13 +1694,30 @@ if _IN_IDA:
                         pass
             except Exception:
                 pass
+        nt = 0
+        try:
+            import ida_nalt, ida_typeinf
+            for ea, prev in _undo["types"]:
+                if prev is None:
+                    ida_nalt.del_tinfo(ea)
+                else:
+                    ida_typeinf.apply_tinfo(ea, prev, ida_typeinf.TINFO_DEFINITE)
+                nt += 1
+        except Exception:
+            pass
+        for ea in _undo["libflag"]:
+            f = ida_funcs.get_func(ea)
+            if f is not None and f.flags & ida_funcs.FUNC_LIB:
+                f.flags &= ~ida_funcs.FUNC_LIB
+                ida_funcs.update_func(f)
         _undo["names"].clear(); _undo["cmts"].clear(); _undo["icmts"].clear(); _undo["pcmts"] = []
+        _undo["types"] = []; _undo["libflag"] = set()
         try:
             ida_auto.auto_wait()
         except Exception:
             pass
-        return T("reverted: %d names, %d func comments, %d insn comments, %d pseudocode comments.",
-                 "已撤回:%d 个函数名、%d 处函数注释、%d 处指令注释、%d 处伪代码注释。") % (nn, nc, ni, npc)
+        return T("reverted: %d names, %d prototypes, %d func comments, %d insn comments, %d pseudocode comments.",
+                 "已撤回:%d 个函数名、%d 个原型、%d 处函数注释、%d 处指令注释、%d 处伪代码注释。") % (nn, nt, nc, ni, npc)
 
     # ---------- dockable panel ----------
     _panel = None
@@ -1522,7 +1731,7 @@ if _IN_IDA:
             def _build(self):
                 L = QtWidgets.QVBoxLayout()
                 top = QtWidgets.QHBoxLayout()
-                self.title = QtWidgets.QLabel("<b>IDA Better Information</b>")
+                self.title = QtWidgets.QLabel("<b>IDA Better Reverse</b>")
                 top.addWidget(self.title, 1)
                 top.addWidget(QtWidgets.QLabel("Lang:"))
                 self.lang = QtWidgets.QComboBox(); self.lang.addItems(["English", "中文"])
@@ -1552,16 +1761,24 @@ if _IN_IDA:
                 set_live_render(True)     # live annotations on by default
 
             def _retext(self):
-                self.cb_live.setText(T("Live decompiler annotations (auto, no database writes)",
-                                       "反编译实时注释（自动，不写数据库）"))
-                self.cb_sig.setText(T("Apply matching FLIRT signature (name library funcs)",
-                                      "套用匹配的 FLIRT 签名（命名库函数）"))
-                self.cb_ann.setText(T("Annotate libc functions (repeatable, keeps your comments)",
-                                      "给 libc 函数加注释（可重复，保留你的注释）"))
-                self.cb_pse.setText(T("Persist decompiler comments to IDB (current function)",
-                                      "把反编译注释写进数据库（当前函数）"))
-                self.cb_math.setText(T("Annotate math/SIMD in disassembly (current function)",
-                                       "在反汇编里标注算术/SIMD（当前函数）"))
+                # short labels (they truncate in a docked panel); details live in tooltips
+                for cb, en, zh, ten, tzh in (
+                        (self.cb_live, "Live annotations", "实时注释",
+                         "Annotate the decompiler as you browse. Writes nothing to the database.",
+                         "浏览时实时给反编译加注释，不写数据库。"),
+                        (self.cb_sig, "Apply FLIRT signature", "套用 FLIRT 签名",
+                         "Name library functions with the signature matching the detected build.",
+                         "用与识别结果匹配的签名给库函数命名。"),
+                        (self.cb_ann, "Describe libc functions", "libc 函数说明",
+                         "Add a one-line description to recognised libc functions (keeps your comments).",
+                         "给识别出的 libc 函数加一行用途说明（保留你的注释）。"),
+                        (self.cb_pse, "Persist comments (this function)", "注释落盘（当前函数）",
+                         "Write the current function's annotations into the database as comments.",
+                         "把当前函数的注释作为普通注释写进数据库。"),
+                        (self.cb_math, "Math / SIMD in disassembly", "反汇编算术 / SIMD",
+                         "Annotate arithmetic and vector instructions of the current function.",
+                         "给当前函数的算术和向量指令加注释。")):
+                    cb.setText(T(en, zh)); cb.setToolTip(T(ten, tzh))
                 self.b0.setText(T("Detect", "检测"))
                 self.b1.setText(T("Run", "执行"))
                 self.b2.setText(T("Undo", "撤回"))
@@ -1630,7 +1847,7 @@ if _IN_IDA:
             if err:
                 ida_kernwin.warning(err); return
             set_live_render(True)
-            f = ida_kernwin.Form(r"""IDA Better Information
+            f = ida_kernwin.Form(r"""IDA Better Reverse
 %s
 <##Apply matching FLIRT signature:{rSig}>
 <##Annotate libc functions (keep yours):{rAnn}>
@@ -1661,19 +1878,19 @@ if _IN_IDA:
             f.Free(); return
         _panel = IBIPanel()
         try:
-            _panel.Show("IDA Better Information", options=ida_kernwin.PluginForm.WOPN_PERSIST)
+            _panel.Show("IDA Better Reverse", options=ida_kernwin.PluginForm.WOPN_PERSIST)
         except Exception:
-            _panel.Show("IDA Better Information")
+            _panel.Show("IDA Better Reverse")
 
     class IBIPlugin(idaapi.plugin_t):
         flags = idaapi.PLUGIN_KEEP
         comment = "Detect runtime/compiler, apply FLIRT, annotate libc + math (undoable)"
         help = "Ctrl-Alt-G"
-        wanted_name = "IDA Better Information"
+        wanted_name = "IDA Better Reverse"
         wanted_hotkey = "Ctrl-Alt-G"
 
         def init(self):
-            print("[IDA Better Information] " + T("loaded. Press Ctrl-Alt-G.",
+            print("[IDA Better Reverse] " + T("loaded. Press Ctrl-Alt-G.",
                                                   "已加载。按 Ctrl-Alt-G 打开面板。"))
             return idaapi.PLUGIN_KEEP
 
