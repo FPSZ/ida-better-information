@@ -17,7 +17,7 @@ English · [简体中文](README.zh-CN.md)
   <source srcset="docs/demo.avif" type="image/avif">
   <img src="docs/demo-poster.png" alt="IDA Better Reverse identifying glibc 2.39 in a stripped static binary, naming its functions and annotating the pseudocode" width="100%">
 </picture>
-<p align="center"><sub>IDA Pro 9.1, stripped static x86-64 binary, one click. <a href="https://github.com/FPSZ/ida-better-reverse/releases/download/v2.2.0/demo.mp4">MP4, 1080p60</a></sub></p>
+<p align="center"><sub>IDA Pro 9.1, stripped static x86-64 binary, one click (recorded with v2.2.0). <a href="https://github.com/FPSZ/ida-better-reverse/releases/download/v2.2.0/demo.mp4">MP4, 1080p60</a></sub></p>
 
 IDA Better Reverse is an IDA Pro plugin for statically linked, stripped ELF binaries, which
 is what most CTF reversing and pwn challenges and a lot of Linux malware look like. It works
@@ -44,7 +44,7 @@ The stripped binary from the recording, opened fresh in IDA. This is part of `ma
     v5 = sub_41A1F0(0);
 ```
 
-After one **Run** (detect, apply signatures, apply prototypes), 903 functions are named. The
+After one **Run** (detect, apply signatures, apply prototypes), 904 functions are named. The
 comments are drawn by a decompiler hook as the function is printed and are not stored in the
 database:
 
@@ -96,7 +96,7 @@ the same libc release, and a stripped static binary rarely tells you which relea
 The usual workaround is to apply dozens of signature files and hope. Even with the right
 release there is a second problem. Signatures generated from `libc.a` with `pelf` describe
 the code as it sits in the object files, and static linking changes some of those bytes. On
-AArch64, signatures built the straightforward way name only 37% of the functions in our test
+AArch64, signatures built the straightforward way name only 38% of the functions in our test
 binary (see [Evaluation](#evaluation)).
 
 ## How it works
@@ -175,8 +175,14 @@ call's actual values:
 - printf/scanf formats with every conversion bound to its argument (`%zu = n`), and a
   warning when a format is not a literal;
 - `syscall(n)`, named from per-architecture kernel tables, with its arguments decoded;
-- nested MMX/SSE/AVX intrinsics folded into one expression, rotates included:
-  `_mm_or_si128(_mm_slli_epi32(x, 12), _mm_srli_epi32(x, 20))` reads `rotl(x, 12) (per 32b)`.
+- nested MMX/SSE/AVX intrinsics read as one plain expression, followed by the lane rules
+  that make it differ from scalar code. From the 2025 强网杯 challenge `butterfly`:
+
+  | Hex-Rays | Note |
+  |---|---|
+  | `_m_pxor((__m64)v28->m64_u64, v42[0])` | `*v28 ^ v42[0]` |
+  | `_m_por(_m_psrlwi(v29, 8u), _m_psllwi(v29, 8u))` | `rotl(v29, 8) (swaps the two bytes of every 16-bit lane)` |
+  | `_m_paddb(_m_por(_m_psllqi(v30, 1u), _m_psrlqi(v30, 0x3Fu)), v42[0])` | `rotl(v30, 1) + v42[0] (+ per byte, no carry between bytes)` |
 
 The notes follow renames and language changes and write nothing. Persisting them, and every
 other change the plugin makes (names, types, library flags, comments), goes through an undo
@@ -199,16 +205,19 @@ IDA's placeholder names (`unknown_libname_N`) do not count as named. The baselin
 | Target | Signatures | Named | Correct | Precision | Coverage¹ |
 |---|---|--:|--:|--:|--:|
 | x86-64 | `pelf` → `sigmake` | 810 | 804 | 99.3% | 82.4% |
-| x86-64 | **this project** | **902** | **901** | **99.9%** | **91.2%** |
+| x86-64 | **this project** | **903** | **902** | **99.9%** | **91.3%** |
 | i386 | `pelf` → `sigmake` | 751 | 750 | 99.9% | 79.4% |
 | i386 | **this project** | **859** | **858** | **99.9%** | **90.8%** |
-| AArch64 | `pelf` → `sigmake` | 330 | 294 | 89.1% | 37.3% |
-| AArch64 | **this project** | **588** | **582** | **99.0%** | **73.8%** |
+| AArch64 | `pelf` → `sigmake` | 340 | 301 | 88.5% | 38.1% |
+| AArch64 | **this project** | **603** | **596** | **98.8%** | **75.4%** |
 
-<sub>¹ Correctly named ÷ functions that have a symbol in the unstripped build (976–984,
-945 and 789). The denominator includes code no signature covers (`_start`, `main` and the
+<sub>¹ Correctly named ÷ functions that have a symbol in the unstripped build (976–988,
+945 and 789–790; IDA's function boundaries differ slightly between runs). The denominator includes code no signature covers (`_start`, `main` and the
 program's own functions) and byte-identical modules that are deliberately left unnamed.
-"This project" is the libc signature after pattern rewriting plus the libgcc signature.</sub>
+"This project" is the libc signature after pattern rewriting plus the libgcc signature. Both rows
+apply their signatures the way the plugin does: again until a pass names nothing new, because
+FLIRT can tell look-alike modules such as `__printf_chk`/`__wprintf_chk` apart only once the
+functions they call have names.</sub>
 
 ### Runtime identification on CTF binaries
 
@@ -281,7 +290,8 @@ The panel shows the detection result with the candidate ranking and offers:
 | **Math / SIMD in disassembly** | The current function's arithmetic as comments: `xor eax, ebx` → `eax = eax ^ ebx`, `ADD X0, X2, X20` → `X0 = X2 + X20` (ARM, AArch64 and MIPS), SSE/AVX lanes spelled out |
 
 **Detect** ranks candidates, **Run** applies the checked options, and **Undo** reverts
-everything the plugin wrote. The UI and the notes are available in English and Chinese.
+everything the plugin wrote and hides the live notes until the next **Run**. The UI and the
+notes are available in English and Chinese.
 
 As a command-line tool, with no IDA required:
 
@@ -316,7 +326,7 @@ python tools/embed-fingerprint.py                 # -> ida_better_reverse.py
   build with [libc.rip](https://libc.rip).
 - Library functions that are byte-identical to another one are left unnamed.
 - On AArch64, a function inside a multi-function object module is named only when the module's
-  first function matches, so coverage there is lower (74% on the test binary).
+  first function matches, so coverage there is lower (75% on the test binary).
 
 ## License
 

@@ -34,7 +34,7 @@ License: MIT
 """
 import os, re, sys, json, gzip, base64, struct, argparse
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 # ======================================================================
 #  Embedded fingerprint database  (gzip + base64 of fingerprint.bin)
@@ -183,24 +183,39 @@ def _elf_layout(data):
        trusting EI_CLASS/EI_DATA, so CTF binaries rewrite those ident bytes to break
        file(1), readelf and disassemblers. If the declared layout yields no known
        machine but the other byte order does, trust the header fields instead."""
+    if len(data) < 0x40:
+        return len(data) > 4 and data[4] == 2, ">" if len(data) > 5 and data[5] == 2 else "<", None
     is64 = data[4] == 2
     en = "<" if data[5] == 1 else ">"
+    declared = 64 if is64 else 32
     ok = lambda e: (EM_TO_ARCH.get(struct.unpack_from(e + "H", data, 18)[0]),
                     struct.unpack_from(e + "H", data, 16)[0] in (1, 2, 3, 4))
+
+    def fits(bits, e):
+        # e_ehsize/e_phentsize are fixed per class (64/56 or 52/32) and sit at different
+        # offsets, so they tell the real class even when e_type/e_machine read fine
+        off, eh, ph = (0x34, 64, 56) if bits == 64 else (0x28, 52, 32)
+        a, b = struct.unpack_from(e + "HH", data, off)
+        return a == eh and b in (ph, 0)
+
+    def note(bits, e, arch):
+        return ("ELF ident bytes tampered: EI_CLASS/EI_DATA claim %d-bit %s-endian, "
+                "header decodes as %d-bit %s-endian %s (to load it in IDA, set file "
+                "byte 4 to %d and byte 5 to %d)"
+                % (declared, "little" if en == "<" else "big",
+                   bits, "little" if e == "<" else "big", arch,
+                   2 if bits == 64 else 1, 1 if e == "<" else 2))
+
     arch, typ_ok = ok(en)
     if arch and typ_ok:
-        return is64, en, None
+        if fits(declared, en) or not fits(96 - declared, en):
+            return is64, en, None
+        return 96 - declared == 64, en, note(96 - declared, en, arch)     # only EI_CLASS rewritten
     for e in ("<", ">"):
         arch, typ_ok = ok(e)
         if arch and typ_ok:
-            bits = _ARCH_BITS.get(arch, 64 if is64 else 32)
-            note = ("ELF ident bytes tampered: EI_CLASS/EI_DATA claim %d-bit %s-endian, "
-                    "header decodes as %d-bit %s-endian %s (to load it in IDA, set file "
-                    "byte 4 to %d and byte 5 to %d)"
-                    % (64 if is64 else 32, "little" if en == "<" else "big",
-                       bits, "little" if e == "<" else "big", arch,
-                       2 if bits == 64 else 1, 1 if e == "<" else 2))
-            return bits == 64, e, note
+            bits = 64 if fits(64, e) else 32 if fits(32, e) else _ARCH_BITS.get(arch, declared)
+            return bits == 64, e, note(bits, e, arch)
     return is64, en, None
 
 
@@ -223,6 +238,8 @@ def _parse_elf_headers(data):
         else:
             phoff = struct.unpack_from(en + "I", data, 28)[0]
             phentsize, phnum = struct.unpack_from(en + "HH", data, 42)
+        if phentsize < (56 if is64 else 32):
+            phnum = 0                    # a forged entry size would re-read one entry 65535 times
         for i in range(phnum):
             off = phoff + i * phentsize
             if off + phentsize > len(data):
@@ -252,7 +269,8 @@ def _parse_elf_headers(data):
                     if tag == 1:                              # DT_NEEDED
                         r["needed"] += 1
             elif p_type == 1 and (p_flags & 1):               # PT_LOAD + X
-                r["exec_ranges"].append((p_offset, p_filesz))
+                if (p_offset, p_filesz) not in r["exec_ranges"]:
+                    r["exec_ranges"].append((p_offset, p_filesz))
     except Exception:
         pass
     return r
@@ -560,20 +578,28 @@ def _cli():
     if not args.binary:
         print("IDA Better Reverse v%s" % __version__)
         ap.print_help(); sys.exit(1)
+    try:
+        with open(args.binary, "rb") as f:
+            raw = f.read()
+    except OSError as ex:
+        sys.exit("cannot read %s: %s" % (args.binary, ex.strerror or ex))
     if args.repair:
-        data = bytearray(open(args.binary, "rb").read())
+        data = bytearray(raw)
         if data[:4] != b"\x7fELF":
             sys.exit("not an ELF file")
         is64, en, note = _elf_layout(bytes(data))
         if not note:
             sys.exit("ELF ident bytes are consistent; nothing to repair")
         data[4], data[5] = (2 if is64 else 1), (1 if en == "<" else 2)
-        with open(args.repair, "wb") as f:
-            f.write(data)
+        try:
+            with open(args.repair, "wb") as f:
+                f.write(data)
+        except OSError as ex:
+            sys.exit("cannot write %s: %s" % (args.repair, ex.strerror or ex))
         print("%s.\nwrote %s (bytes 4-5 = %02X %02X)" % (note, args.repair, data[4], data[5]))
         return
     force = "static" if args.static else ("dynamic" if args.dynamic else None)
-    r = detect(path=args.binary, force=force, top=args.top, arch_hint=args.arch)
+    r = detect(data=raw, force=force, top=args.top, arch_hint=args.arch)
     if args.json:
         print(json.dumps(r, indent=2)); return
     print("=" * 60)
@@ -601,6 +627,8 @@ def canon(name):
     n = name or ''
     n = re.sub(r'^\.+', '', n)               # import-thunk notation: .open -> open
     n = re.sub(r'^j_', '', n)                # jump thunk: j_open -> open
+    if re.fullmatch(r'_+[eE]xit(?:@.*)?', n):
+        return "_exit"                       # _exit/_Exit skip atexit handlers; exit does not
     n = re.sub(r'^_+', '', n); n = re.sub(r'@.*$', '', n)
     n = re.sub(r'^isoc\d+_', '', n)          # __isoc99_scanf / __isoc23_strtol
     n = re.sub(r'_chk$', '', n); n = re.sub(r'_unlocked$', '', n)
@@ -635,6 +663,11 @@ _VARIANTS = {
     "__strcat_chk":    ("strcat",    [0, 1]),
     "__strncat_chk":   ("strncat",   [0, 1, 2]),
     "__stpcpy_chk":    ("stpcpy",    [0, 1]),
+    "__syslog_chk":    ("syslog",    [0, 2]),              # (pri, flag, fmt, ...)
+    "__vsprintf_chk":  ("vsprintf",  [0, 3]),              # (s, flag, slen, fmt, ap)
+    "__fread_chk":     ("fread",     [0, 2, 3, 4]),        # (ptr, ptrlen, size, n, fp)
+    "__read_chk":      ("read",      [0, 1, 2]),           # (fd, buf, nbytes, buflen)
+    "__fgets_chk":     ("fgets",     [0, 2, 3]),           # (buf, size, n, fp)
 }
 
 
@@ -657,13 +690,16 @@ except Exception:
     _IN_IDA = False
 
 if _IN_IDA:
-    try:
-        from PySide6 import QtWidgets; _HAS_QT = True
-    except Exception:
+    # the binding must match IDA's own Qt: Qt6/PySide6 from IDA 9.2, Qt5/PyQt5 before.
+    # A pip-installed PySide6 inside an IDA 9.1 would otherwise load Qt6 into a Qt5 process.
+    _HAS_QT = False
+    for _qt in (("PySide6", "PyQt5") if getattr(idaapi, "IDA_SDK_VERSION", 0) >= 920
+                else ("PyQt5", "PySide6")):
         try:
-            from PyQt5 import QtWidgets; _HAS_QT = True
+            QtWidgets = __import__(_qt + ".QtWidgets", fromlist=["QtWidgets"]); _HAS_QT = True
+            break
         except Exception:
-            _HAS_QT = False
+            pass
 
     PFX = "libc: "
     OPX = "op: "
@@ -765,10 +801,10 @@ if _IN_IDA:
      "close":("close {0}","关闭 {0}"), "fclose":("close stream {0}","关闭文件流 {0}"),
      "read":("read {2} bytes from {0}","从 {0} 读 {2} 字节"),
      "write":("write {2} bytes to {0}","向 {0} 写 {2} 字节"),
-     "lseek":("seek {0} to {1} ({2})","{0} 定位到 {1} ({2})"),
+     "lseek":("seek {0} to {pos}","{0} 定位到 {pos}"),
      "fread":("read {n} bytes -> {0}","读 {n} 字节 -> {0}"),
      "fwrite":("write {n} bytes from {0}","写 {n} 字节(来自 {0})"),
-     "fseek":("seek {0} to {1}","{0} 定位到 {1}"), "fgets":("read a line -> {0} (max {1})","读一行 -> {0}(上限 {1})"),
+     "fseek":("seek {0} to {pos}","{0} 定位到 {pos}"), "fgets":("read a line -> {0} (max {1})","读一行 -> {0}(上限 {1})"),
      "malloc":("alloc {0} bytes","分配 {0} 字节"), "calloc":("alloc {n} bytes, zeroed","分配 {n} 字节并清零"),
      "realloc":("resize {0} -> {1} bytes","把 {0} 重分配为 {1} 字节"), "free":("free {0}","释放 {0}"),
      "aligned_alloc":("alloc {1} bytes, {0}-aligned","分配 {1} 字节,{0} 对齐"),
@@ -845,7 +881,7 @@ if _IN_IDA:
         "mips": [(0x8, "O_APPEND"), (0x10, "O_DSYNC"), (0x80, "O_NONBLOCK"), (0x100, "O_CREAT"),
                  (0x200, "O_TRUNC"), (0x400, "O_EXCL"), (0x800, "O_NOCTTY"), (0x1000, "O_ASYNC"),
                  (0x2000, "O_LARGEFILE"), (0x4000, "O_SYNC"), (0x8000, "O_DIRECT"),
-                 (0x10000, "O_DIRECTORY"), (0x20000, "O_NOFOLLOW")],
+                 (0x10000, "O_DIRECTORY"), (0x20000, "O_NOFOLLOW"), (0x400000, "O_TMPFILE")],
     }
 
     _O_WIN = [(0x8, "_O_APPEND"), (0x10, "_O_RANDOM"), (0x20, "_O_SEQUENTIAL"), (0x40, "_O_TEMPORARY"),
@@ -938,6 +974,13 @@ if _IN_IDA:
               0x59616d61:"PR_SET_PTRACER"}
     _FCNTL = {0:"F_DUPFD",1:"F_GETFD",2:"F_SETFD",3:"F_GETFL",4:"F_SETFL",5:"F_GETLK",6:"F_SETLK",
               7:"F_SETLKW",8:"F_SETOWN",9:"F_GETOWN",1030:"F_DUPFD_CLOEXEC"}
+    # MIPS keeps the old SVR4 numbers for the lock and owner requests
+    _FCNTL_MIPS = {**_FCNTL, 5: "5", 8: "8", 9: "9", 14: "F_GETLK", 23: "F_GETOWN", 24: "F_SETOWN"}
+
+    def _dec_fcntl(v):
+        return (_FCNTL_MIPS if _family() == "mips" else _FCNTL).get(v, str(v))
+
+    _AF_WIN = {0: "AF_UNSPEC", 1: "AF_UNIX", 2: "AF_INET", 23: "AF_INET6"}
 
     _FUTEX = {0: "FUTEX_WAIT", 1: "FUTEX_WAKE", 2: "FUTEX_FD", 3: "FUTEX_REQUEUE",
               4: "FUTEX_CMP_REQUEUE", 5: "FUTEX_WAKE_OP", 6: "FUTEX_LOCK_PI", 7: "FUTEX_UNLOCK_PI",
@@ -968,13 +1011,13 @@ if _IN_IDA:
         "kill":   {1: _dec_sig}, "raise": {0: _dec_sig},
         "signal": {0: _dec_sig, 1: _dec_handler}, "sigaction": {0: _dec_sig},
         "ptrace": {0: _lut(_PTRACE)}, "prctl": {0: _lut(_PRCTL)},
-        "socket": {0: lambda v: "AF_INET6" if v == 23 and _DEC_CTX["pe"] else _AF.get(v, str(v)),
+        "socket": {0: lambda v: (_AF_WIN if _DEC_CTX["pe"] else _AF).get(v, str(v)),
                    1: _dec_socktype},
         "setvbuf": {2: lambda v: {0: T("_IOFBF (full)", "_IOFBF(全缓冲)"),
                                   1: T("_IOLBF (line)", "_IOLBF(行缓冲)"),
                                   2: T("_IONBF (unbuffered)", "_IONBF(无缓冲)")}.get(v, str(v))},
         "access": {1: lambda v: _bits(v, _ACCESS)},
-        "fcntl":  {1: _lut(_FCNTL)}, "futex": {1: _dec_futex},
+        "fcntl":  {1: _dec_fcntl}, "futex": {1: _dec_futex},
         "putchar": {0: _dec_char}, "putc": {0: _dec_char}, "fputc": {0: _dec_char},
     }
     # functions whose first fd arg reads nicely as stdin/stdout/stderr
@@ -1023,16 +1066,38 @@ if _IN_IDA:
                "sha1rnds4":"SHA-1 4 rounds","sha1nexte":"SHA-1 next E","sha256rnds2":"SHA-256 2 rounds",
                "sha256msg1":"SHA-256 msg sched 1","sha256msg2":"SHA-256 msg sched 2"}
 
-    _LANE_ZH = {"per byte":"每字节", "per u8":"每 u8", "per 16b":"每 16 位", "per u16":"每 u16",
-                "per 32b":"每 32 位", "per u32":"每 u32", "per 64b":"每 64 位", "per u64":"每 u64",
-                "per f32":"每 f32", "per f64":"每 f64", "64b":"64 位", "128b":"128 位",
-                "256b":"256 位", "512b":"512 位"}
     _INFIX = {"add":"+", "sub":"-", "mul":"*", "mullo":"*", "and":"&", "or":"|", "xor":"^",
               "sll":"<<", "slli":"<<", "srl":">>", "srli":">>", "sra":">>", "srai":">>"}
     _MMX_OP = {"pxor":"xor", "por":"or", "pand":"and", "pandn":"andnot", "mull":"mullo", "mulh":"mulhi"}
     _VEC_FN_ZH = {"interleave lo":"交错低半", "interleave hi":"交错高半", "shuffle":"重排",
                   "shuffle lo":"重排低半", "shuffle hi":"重排高半", "pack (sat)":"饱和打包",
                   "pack (usat)":"无符号饱和打包", "blend":"混合"}
+    # lane key -> (bits, English unit, Chinese unit), for the plain-language tail
+    _LANE_UNIT = {"per byte": (8, "byte", "字节"), "per u8": (8, "unsigned byte", "无符号字节"),
+                  "per 16b": (16, "16-bit lane", "16 位"), "per u16": (16, "unsigned 16-bit lane", "无符号 16 位"),
+                  "per 32b": (32, "32-bit lane", "32 位"), "per u32": (32, "unsigned 32-bit lane", "无符号 32 位"),
+                  "per 64b": (64, "64-bit lane", "64 位"), "per u64": (64, "unsigned 64-bit lane", "无符号 64 位"),
+                  "per f32": (32, "float", "f32"), "per f64": (64, "double", "f64"),
+                  "64b": (64, "64-bit lane", "64 位"), "128b": (128, "128-bit lane", "128 位"),
+                  "256b": (256, "256-bit lane", "256 位"), "512b": (512, "512-bit lane", "512 位")}
+    _BITWISE_SYMS = {"^", "&", "|", "&~", "andnot"}       # no lanes: a bit is a bit
+
+    def _reg_bits(h):
+        """Register width of an intrinsic: _m_* and *_pi8/16/32/_si64 are MMX."""
+        if h.startswith("m_") or re.search(r"_(?:pi\d+|si64)$", h):
+            return 64
+        return 512 if h.startswith("mm512_") else 256 if h.startswith("mm256_") else 128
+
+    _M64_WHOLE = re.compile(r"^(.+?)(->|\.)m64_[iu]64$")
+
+    def _vec_operand(t):
+        """`p->m64_u64` is the whole 64-bit value at p, `x.m64_u64` is x."""
+        m = _M64_WHOLE.match(t)
+        if not m:
+            return t
+        if m.group(2) == ".":
+            return m.group(1)
+        return "*" + (m.group(1) if re.match(r"^\w+$", m.group(1)) else "(%s)" % m.group(1))
 
     def _intrin_note(helper, args=()):
         """Explain an MMX/SSE/AVX/crypto intrinsic call. `args` are the operands as
@@ -1040,7 +1105,7 @@ if _IN_IDA:
         h = (helper or "").lstrip("_")
         a = [x for x in args if x]
         # crypto first (highest value)
-        for k, v in _CRYPTO.items():
+        for k, v in sorted(_CRYPTO.items(), key=lambda kv: -len(kv[0])):    # aesenclast before aesenc
             if k in h:
                 return OPX + v + ("(%s)" % ", ".join(a) if a else "")
         if h == "m_empty":
@@ -1056,10 +1121,8 @@ if _IN_IDA:
                 return None
             op = _MMX_OP.get(m.group(1), m.group(1))
             lane = {"b":"per byte", "w":"per 16b", "d":"per 32b", "q":"per 64b"}.get(m.group(2), "64b")
-        lane_s = T(lane, _LANE_ZH.get(lane, lane)) if lane else ""
-        if op in ("sra", "srai"):
-            lane_s = T("signed, ", "有符号, ") + lane_s
-        tail = " (%s)" % lane_s if lane_s else ""
+        lk = ("signed " + lane) if op in ("sra", "srai") else lane
+        tail = _lane_tail({(lk, _reg_bits(h)): [_INFIX.get(op) or _VEC_OP.get(op, op)]})
         if len(a) >= 2:
             x, y = a[0], a[1]
             if op == "xor" and x == y:
@@ -1092,17 +1155,75 @@ if _IN_IDA:
                     {"b":"per byte", "w":"per 16b", "d":"per 32b", "q":"per 64b"}.get(m.group(2), "64b"))
         return None
 
+    _BINOP = re.compile(r" (\|\||&&|<<|>>|==|!=|<=|>=|[|^&+\-*/%<>?:]) ")
+    _ASSOC = {"|", "^", "&", "+", "*"}
+
+    def _scan(t, limit=None):
+        """Walk `t` outside string literals, yielding (index, char, open brackets)."""
+        stack, q, i = [], None, 0
+        end = len(t) if limit is None else min(limit, len(t))
+        while i < end:
+            c = t[i]
+            if q:
+                if c == "\\":
+                    i += 1
+                elif c == q:
+                    q = None
+            elif c in "\"'":
+                q = c
+            elif c in "([{":
+                stack.append(")]}"["([{".index(c)])
+            elif c in ")]}" and stack:
+                stack.pop()
+            else:
+                yield i, c, stack
+            i += 1
+
+    def _top_ops(t):
+        """Binary operators of `t` that are outside every bracket."""
+        return {m.group(1) for i, c, st in _scan(t) if c == " " and not st
+                for m in [_BINOP.match(t, i)] if m}
+
+    def _operand(t, sym=None, left=False):
+        """Operand text, bracketed only when needed. A chain of one associative
+        operator (`a | b | c`) and a term with no operator outside brackets
+        (`*(p + 4)`, `rotl(x, 1)`) need none."""
+        if t[1]:
+            return t[0]
+        ops = _top_ops(t[0])
+        if not ops or (sym in _ASSOC and ops == {sym}) or (sym == "-" and left and ops <= {"+", "-"}):
+            return t[0]
+        return "(%s)" % t[0]
+
+    def _clip(t, n=140):
+        """Shorten at an operator or comma and close what is still open, so a long
+        chain reads `a | b | (c & ...)` instead of stopping mid-bracket."""
+        if len(t) <= n:
+            return t
+        cuts = []
+        for i, c, st in _scan(t, n - 8):
+            m = _BINOP.match(t, i) if c == " " else None
+            if c == "," and t[i + 1:i + 2] == " ":
+                cuts.append((i + 2, len(st), "".join(reversed(st))))
+            elif m and m.group(1) not in ("?", ":"):
+                cuts.append((m.end(), len(st), "".join(reversed(st))))
+        if not cuts:
+            return t[:n - 3] + "..."
+        late = [c for c in cuts if c[0] >= n // 2] or cuts        # the shallowest cut in the second half
+        end, _, closers = [c for c in late if c[1] == min(d for _, d, _ in late)][-1]
+        return t[:end] + "..." + closers
+
     def _vec_text(h, a, lanes):
         """Render one intrinsic over already-rendered operands [(text, atomic)] as
         (text, atomic), recording its lane in `lanes`; None if it does not fold."""
-        p = lambda t: t[0] if t[1] else "(%s)" % t[0]
+        p = _operand
         if _V_ZERO.match(h):
             return "0", True
         if a and _V_SPLAT.match(h):
             return "splat(%s)" % a[0][0], True
         if a and _V_SCALAR.match(h):
             return a[0]
-        if a and _V_LOAD.match(h):
+        if len(a) == 1 and _V_LOAD.match(h):        # 2-arg loadl/loadh_pd merge into a vector
             t = a[0][0]
             if t.startswith("&") and re.match(r"&[\w.]+$", t):
                 return t[1:], True                         # *&x is x
@@ -1126,13 +1247,14 @@ if _IN_IDA:
         if op == "xor" and x[0] == y[0]:
             return "0", True
         atomic = False
+        reg = _reg_bits(h)
         if op in ("sll", "slli", "srl", "srli") and lane in ("128b", "256b", "512b"):
             # _mm_slli_si128 / _mm_srli_si128 (pslldq/psrldq) shift by BYTES, per 128-bit lane
             sym = _INFIX[op]
             txt = "%s %s %s %s" % (p(x), sym, y[0], T("bytes", "字节"))
-            lanes.setdefault(lane, [])
-            if sym not in lanes[lane]:
-                lanes[lane].append(sym)
+            syms = lanes.setdefault(("128b", reg), [])
+            if sym not in syms:
+                syms.append(sym)
             return txt, False
         if op in ("or", "xor") and not x[1] and not y[1]:
             # (v << n) | (v >> (w - n)) on w-bit lanes is a rotate (ChaCha, BLAKE, SipHash...)
@@ -1142,31 +1264,42 @@ if _IN_IDA:
                 m2 = re.fullmatch(r"(.+) >> (\d+)", a2)
                 if m1 and m2 and m1.group(1) == m2.group(1):
                     w = int(m1.group(2)) + int(m2.group(2))
-                    if w in (16, 32, 64) and "per %db" % w in lanes:
-                        rot = (m1.group(1), int(m1.group(2)), w)
+                    # both shifts logical: (v << n) | (v >>(signed) m) sign-fills, no rotate
+                    keys = [k for k in lanes if k[0] == "per %db" % w and "<<" in lanes[k] and ">>" in lanes[k]]
+                    if w in (16, 32, 64) and keys:
+                        rot = (m1.group(1), int(m1.group(2)), w, keys[0])
             if rot:
-                base, n, w = rot
-                lk = "per %db" % w
-                lanes[lk] = [s for s in lanes[lk] if s not in ("<<", ">>")] + ["rotl"]
-                if not lanes[lk]:
-                    del lanes[lk]
+                base, n, w, lk = rot
+                # rotating by half the lane swaps its two halves (bswap16 for 16-bit lanes)
+                lanes[lk] = [s for s in lanes[lk] if s not in ("<<", ">>")] + ["swap" if 2 * n == w else "rotl"]
                 return "rotl(%s, %d)" % (base, n), True
+        if op in ("or", "xor", "add") and "0" in (x[0], y[0]):
+            return y if x[0] == "0" else x          # 0 | v is v (accumulators start at zero)
+        if op in ("packs", "packus") and lane in ("per 16b", "per 32b"):
+            # narrow two vectors into one, every lane clamped: pack_i8(a, b) for packs_epi16
+            half = 8 if lane == "per 16b" else 16
+            lo, hi = (-(1 << (half - 1)), (1 << (half - 1)) - 1) if op == "packs" else (0, (1 << half) - 1)
+            syms = lanes.setdefault((lane, reg), [])
+            if "clamp %d..%d" % (lo, hi) not in syms:
+                syms.append("clamp %d..%d" % (lo, hi))
+            return "pack_%s%d(%s, %s)" % ("i" if op == "packs" else "u", half, x[0], y[0]), True
         if op in _INFIX:
-            sym, txt = _INFIX[op], "%s %s %s" % (p(x), _INFIX[op], p(y))
+            sym = _INFIX[op]
+            txt = "%s %s %s" % (p(x, sym, True), sym, p(y, sym))
         elif op == "andnot":
-            sym, txt = "&~", "~%s & %s" % (p(x), p(y))
+            sym, txt = "&~", "~%s & %s" % (p(x), p(y, "&"))
         elif op in ("cmpeq", "cmpgt"):
             sym, txt = _VEC_OP[op], "%s %s %s ? ~0 : 0" % (p(x), _VEC_OP[op], p(y))
         elif op == "mulhi":
-            sym, txt, atomic = "hi*", T("hi(%s * %s)", "高半(%s * %s)") % (x[0], y[0]), True
-        else:                                   # min/max/avg/shuffle/unpack/pack/blend
+            sym, txt, atomic = "hi*", T("hi(%s * %s)", "高半(%s * %s)") % (p(x), p(y)), True
+        else:                                   # min/max/avg/shuffle/unpack/blend
             sym = T(_VEC_OP[op], _VEC_FN_ZH.get(_VEC_OP[op], _VEC_OP[op]))
             txt, atomic = "%s(%s)" % (sym, ", ".join(t[0] for t in a)), True
         if op in ("sra", "srai"):
             lane = "signed " + lane
-        lanes.setdefault(lane, [])
-        if sym not in lanes[lane]:
-            lanes[lane].append(sym)
+        syms = lanes.setdefault((lane, reg), [])
+        if sym not in syms:
+            syms.append(sym)
         return txt, atomic
 
     def _shuffle_text(h, a):
@@ -1211,7 +1344,7 @@ if _IN_IDA:
         y = x
         while y.op == hr.cot_cast and y.x is not None:
             y = y.x
-        if depth < 8 and y.op == hr.cot_call and y.x is not None and y.x.op == hr.cot_helper:
+        if depth < 32 and y.op == hr.cot_call and y.x is not None and y.x.op == hr.cot_helper:
             sub_used, sub_lanes = set(), {}
             sub = [_vec_render(cfunc, a, sub_used, sub_lanes, depth + 1) for a in y.a]
             r = _vec_text((y.x.helper or "").lstrip("_"), sub, sub_lanes)
@@ -1221,20 +1354,44 @@ if _IN_IDA:
                 for k, v in sub_lanes.items():
                     lanes.setdefault(k, []).extend(s for s in v if s not in lanes.get(k, []))
                 return r
-        t = _arg_text(cfunc, x)
+        t = _vec_operand(_arg_text(cfunc, x))
         return t, " " not in t
 
     def _lane_tail(lanes):
-        def tr(l):
-            signed = l.startswith("signed ")
-            base = l[7:] if signed else l
-            s = T(base, _LANE_ZH.get(base, base))
-            return (T("signed ", "有符号 ") + s) if signed else s
-        if not lanes:
-            return ""
-        if len(lanes) == 1:
-            return " (%s)" % tr(next(iter(lanes)))
-        return " (%s)" % "; ".join("%s %s" % (" ".join(v), tr(k)) for k, v in lanes.items())
+        """Plain-language conditions after the expression, e.g. `(+ per byte, no carry
+        between bytes)`. Bitwise operators and lanes as wide as the register say
+        nothing worth a note, so they get none."""
+        parts = []
+        groups = []
+        for (lane, reg), syms in lanes.items():
+            signed = lane.startswith("signed ")
+            base = lane[7:] if signed else lane
+            bits, en, zh = _LANE_UNIT.get(base, (0, base, base))
+            syms = [s for s in syms if s not in _BITWISE_SYMS]
+            if syms and (bits < reg or base.startswith("per f")):
+                groups.append((signed, base, bits, en, zh, syms))
+        for signed, base, bits, en, zh, syms in groups:
+            for s in [s for s in syms if s.startswith("clamp ")]:
+                parts.append(T("each %s clamped to %s" % (en, s[6:]), "每个 %s饱和到 %s" % (zh, s[6:])))
+            syms = [s for s in syms if not s.startswith("clamp ")]
+            if not syms:
+                continue
+            if "swap" in syms:
+                parts.append(T("swaps the two bytes of every 16-bit lane", "每个 16 位内交换两个字节") if bits == 16
+                             else T("swaps the two halves of every %s" % en, "每个 %s 内交换高低两半" % zh))
+                syms = [s for s in syms if s != "swap"]
+                if not syms:
+                    continue
+            if len(groups) == 1:
+                # a named operation (min, interleave lo, ...) is already in the expression
+                syms = [s for s in syms if not re.match(r"^[^\W\d]", s)] or [""]
+            ops = ((T("signed ", "有符号 ") if signed else "") + " ".join(syms)).strip()
+            zu = "%s%s%s" % (" " if zh[:1].isascii() else "", zh, " " if zh[-1:].isascii() else "")
+            txt = T(("%s per %s" % (ops, en)).strip(), ("%s 按%s分别算" % (ops, zu)).strip())
+            if "+" in syms or "-" in syms:
+                txt += T(", no carry between %ss" % ("byte" if bits == 8 else "lane"), ", 互不进位")
+            parts.append(txt)
+        return " (%s)" % "; ".join(parts) if parts else ""
 
     def _vec_call_note(cfunc, e, used):
         """Note for an intrinsic call `e`, or None. Nested foldable intrinsics are
@@ -1249,8 +1406,7 @@ if _IN_IDA:
                 if r[0] == "0" and len(sub) >= 2 and sub[0][0] == sub[1][0]:
                     note = OPX + "%s ^ %s = 0 (%s)" % (sub[0][0], sub[1][0], T("zeroing", "清零"))
                 else:
-                    txt = r[0] if len(r[0]) <= 140 else r[0][:137] + "..."
-                    note = OPX + txt + _lane_tail(lanes)
+                    note = OPX + _clip(r[0]) + _lane_tail(lanes)
         if note is None:
             note = _intrin_note(e.x.helper, [t for t, _ in sub])
         if note:
@@ -1311,8 +1467,17 @@ if _IN_IDA:
     def T(en, zh):
         return zh if LANG == "zh" else en
 
-    # undo snapshots: names + function comments + insn comments + pseudocode comments
-    _undo = {"names": {}, "cmts": {}, "icmts": {}, "pcmts": [], "types": [], "libflag": set()}
+    # Undo journal. Each entry is [value before the plugin's first change, the plugin's
+    # latest value]: the first is what Undo restores (so running twice still undoes to the
+    # original), the second tells Undo whether the user has edited the item since.
+    _undo = {"names": {}, "cmts": {}, "icmts": {}, "pcmts": {}, "types": {}, "libflag": set()}
+
+    def _journal(kind, key, old, new):
+        e = _undo[kind].get(key)
+        if e is None:
+            _undo[kind][key] = [old, new]
+        else:
+            e[1] = new
 
     def _cur_arch():
         try:
@@ -1490,9 +1655,10 @@ if _IN_IDA:
             if _is_dummy_name(name) or ida_nalt.is_userti(ea):
                 continue
             tif = None
+            # the exact name first: lseek64 must keep its 64-bit off_t on 32-bit targets
             cands = [name.lstrip("_"), name]
             if not name.endswith("_chk"):     # a fortified variant must not get its base's prototype
-                cands.insert(0, canon(name))
+                cands.append(canon(name))
             for cand in dict.fromkeys(cands):
                 tif = lookup(cand) if cand else None
                 if tif:
@@ -1504,13 +1670,13 @@ if _IN_IDA:
         return n
 
     def _type_snapshot():
-        """{ea: tinfo copy} for every function that has a stored type."""
+        """{ea: (tinfo copy, user-specified?)} for every function that has a stored type."""
         import ida_typeinf, ida_nalt
         snap = {}
         for ea in idautils.Functions():
             t = ida_typeinf.tinfo_t()
             if ida_nalt.get_tinfo(t, ea):
-                snap[ea] = t
+                snap[ea] = (t, bool(ida_nalt.is_userti(ea)))
         return snap
 
     # IDA's placeholder names: FLIRT's "library code, name unknown" and plain auto-names
@@ -1526,10 +1692,11 @@ if _IN_IDA:
         for ea in idautils.Functions():
             nm = ida_funcs.get_func_name(ea) or ""
             old_nm, old_lib, old_cmt = before.get(ea, ("", False, ""))
-            if (idc.get_func_cmt(ea, 1) or "") != old_cmt and ea not in _undo["cmts"]:
-                _undo["cmts"][ea] = old_cmt            # FLIRT writes the library name here
+            cmt = idc.get_func_cmt(ea, 1) or ""
+            if cmt != old_cmt:
+                _journal("cmts", ea, old_cmt, cmt)     # FLIRT writes the library name here
             if old_nm != nm:
-                _undo["names"].setdefault(ea, old_nm)
+                _journal("names", ea, old_nm, nm)
                 changed += not _AUTONAME.match(nm)
             if not old_lib and ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB:
                 _undo["libflag"].add(ea)       # FLIRT marks matches as library functions
@@ -1613,12 +1780,22 @@ if _IN_IDA:
         if not applied:
             return T("no FLIRT .sig for %s in IDA sig/pc. Generate one with FLAIR or grab a community set.",
                      "IDA sig/pc 里没有 %s 的签名。用 FLAIR 生成或从社区签名集拿。") % best
+        # FLIRT tells look-alike modules apart by the names they reference
+        # (__printf_chk vs __wprintf_chk call __vfprintf_internal / __vfwprintf_internal).
+        # A callee named later in the same pass leaves its caller unmatched, so apply
+        # again until a pass names nothing new.
+        for _ in range(2):
+            more = sum(_apply_one_sig(s) for s in applied)
+            total_changed += more
+            if not more:
+                break
         typed = _apply_prototypes()
         types_after = _type_snapshot()
         for ea in set(types_before) | set(types_after):
             b, a = types_before.get(ea), types_after.get(ea)
-            if (str(b) if b is not None else None) != (str(a) if a is not None else None):
-                _undo["types"].append((ea, b))   # b None -> the function had no type before
+            bs, as_ = (str(b[0]) if b else None), (str(a[0]) if a else None)
+            if bs != as_:
+                _journal("types", ea, b, as_)    # b None -> the function had no type before
         named = sum(1 for ea in idautils.Functions() if not _AUTONAME.match(ida_funcs.get_func_name(ea) or ""))
         return T("applied %s; named %d functions this run (%d named in total); %d prototypes applied.",
                  "已套用 %s;本次命名 %d 个函数(共 %d 个有名字);套用原型 %d 个。") % (
@@ -1639,19 +1816,41 @@ if _IN_IDA:
             new = d if not body else (d + "\n" + body)
             if new == old:
                 continue
-            if ea not in _undo["cmts"]:
-                _undo["cmts"][ea] = old
             try:
                 idc.set_func_cmt(ea, new, 1); n += 1
+                _journal("cmts", ea, old, new)
             except Exception:
                 pass
         return n
 
+    _JOIN = "  | "        # a note and the comment text that was already there share one line
+
+    def _after_join(ln):
+        """The text after the first `  | ` outside a quoted string, or ''."""
+        q, i = False, 0
+        while i < len(ln):
+            c = ln[i]
+            if q and c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                q = not q
+            elif not q and ln.startswith(_JOIN, i):
+                return ln[i + len(_JOIN):].strip()
+            i += 1
+        return ""
+
     def _strip_managed(text):
-        """Remove our managed lines (libc:/op:/sys:) from a comment, keep the rest."""
+        """Remove our notes (libc:/op:/sys:) from a comment and keep everything else,
+        including the user's text joined onto a note's line with `  | `."""
         if not text:
             return ""
-        keep = [ln for ln in text.split("\n") if not ln.startswith(_MANAGED)]
+        keep = []
+        for ln in text.split("\n"):
+            while ln.startswith(_MANAGED):
+                ln = _after_join(ln)
+            if ln:
+                keep.append(ln)
         return "\n".join(keep).strip("\n")
 
     # ---------- argument rendering ----------
@@ -1701,6 +1900,10 @@ if _IN_IDA:
             s = s[:24] + "..."
         return '"%s"' % s
 
+    _VALUE_CAST = re.compile(r"\((?:(?:unsigned|signed|const|volatile) )*(?:__int\d+|int|char|short|"
+                             r"long long|long|_BYTE|_WORD|_DWORD|_QWORD|_OWORD|_BOOL\d|bool|size_t|"
+                             r"float|double|__m64|__m128[id]?|__m256[id]?|__m512[id]?)\)")
+
     def _arg_text(cfunc, a):
         import ida_hexrays as hr
         import ida_lines
@@ -1727,12 +1930,33 @@ if _IN_IDA:
                 if inner.op == hr.cot_obj:
                     return _str_at(inner.obj_ea) or ("&" + (idc.get_name(inner.obj_ea) or "0x%X" % inner.obj_ea))
             # fall back to Hex-Rays' own rendering: handles buf+8, s->field, arr[i], &x ...
-            txt = ida_lines.tag_remove(a.print1(cfunc))
-            txt = txt.replace("\n", " ")
-            return txt if len(txt) <= 32 else txt[:32] + "..."
+            # Value casts go (pointer casts stay: they decide pointer arithmetic). Text
+            # still too long becomes "...": cutting it mid-parenthesis reads worse, and
+            # the full expression is right there in the call.
+            txt = _VALUE_CAST.sub("", ida_lines.tag_remove(a.print1(cfunc)).replace("\n", " "))
+            return txt if len(txt) <= 36 else "..."
         except Exception:
             pass
         return "?"
+
+    def _writable(ea):
+        try:
+            import ida_segment
+            s = ida_segment.getseg(ea)
+            if s is None:
+                return False
+            if s.perm:
+                return bool(s.perm & ida_segment.SEGPERM_WRITE)
+            return (ida_segment.get_segm_name(s) or "").lstrip(".") in ("bss", "data")
+        except Exception:
+            return False
+
+    def _is_float(a):
+        import ida_hexrays as hr
+        try:
+            return a.op == hr.cot_fnum or bool(a.type is not None and a.type.is_floating())
+        except Exception:
+            return False
 
     def _arg_int(a):
         """Return the integer value of a constant arg (after casts), else None."""
@@ -1750,8 +1974,12 @@ if _IN_IDA:
     _FMT_FUNCS = {"printf": 0, "vprintf": 0, "fprintf": 1, "vfprintf": 1, "dprintf": 1,
                   "sprintf": 1, "vsprintf": 1, "snprintf": 2, "vsnprintf": 2, "syslog": 1,
                   "scanf": 0, "fscanf": 1, "sscanf": 1}
-    _CONV = re.compile(r"%(?:\d+\$)?[-+ #0']*(\*|\d+)?(?:\.(\*|\d+))?"
-                       r"(?:hh|h|ll|l|j|z|t|L|q)?([diouxXeEfFgGaAcspnm%])")
+    # printf: position, width, precision, conversion (MSVC I64/I32/w and %S/%C included)
+    _CONV = re.compile(r"%(?:(\d+)\$)?[-+ #0']*(\*(?:\d+\$)?|\d+)?(?:\.(\*(?:\d+\$)?|\d+))?"
+                       r"(?:hh|h|ll|l|j|z|t|L|q|I64|I32|I|w)?([diouxXeEfFgGaAcCsSpnm%])")
+    # scanf: '*' suppresses the assignment (no argument), %[set], %ms allocates
+    _SCONV = re.compile(r"%(\*)?(?:(\d+)\$)?\d*(?:hh|h|ll|l|j|z|t|L|q|m|I64|I32|I|w)?"
+                        r"([diouxXeEfFgGaAcCsSpn%]|\[\^?\]?[^\]]*\])")
 
     def _cstr_arg(a):
         """Full text of a string-literal argument (untruncated), else None."""
@@ -1785,44 +2013,60 @@ if _IN_IDA:
         if fi >= len(args):
             return None
         fmt = _cstr_arg(args[fi])
+        gea = _global_ea(args[fi])
+        bug = T("%s: the format (%s) is not a literal, check for a format-string bug",
+                "%s 的格式串 %s 不是字面量, 注意格式化字符串漏洞") % (base, A[fi])
+        if not fmt and gea is not None and _writable(gea) and not base.startswith("v"):
+            f = ida_bytes.get_flags(gea)
+            if not ida_bytes.is_data(f) or ida_bytes.is_byte(f):
+                return bug                # printf(global_buf): an empty .bss/.data byte buffer
         if fmt is None:
-            if base.startswith("v") or _global_ea(args[fi]) is not None:
-                # a va_list wrapper passing its format through, or a global we cannot
-                # decode: neither is evidence of a format-string bug
+            if base.startswith("v") or gea is not None:
+                # a va_list wrapper passing its format through, or a read-only global we
+                # cannot decode: neither is evidence of a format-string bug
                 return T("%s %s", "%s 格式串 %s") % (base, A[fi])
-            return T("%s with non-literal format %s: check for a format-string bug",
-                     "%s 的格式串 %s 不是字面量, 注意格式化字符串漏洞") % (base, A[fi])
+            return bug
         q = fmt.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
         q = '"%s"' % (q if len(q) <= 24 else q[:24] + "...")
         binds, k, rest, rest_raw = [], 0, A[fi + 1:], args[fi + 1:]
-        # SysV x86-64 / AArch64 pass floating-point varargs in vector registers, which
-        # Hex-Rays does not show among the call's arguments: they take no slot here
+        # SysV x86-64 / AArch64 pass floating-point varargs in vector registers. Whether
+        # Hex-Rays shows them depends on the call (an optimised stripped call often drops
+        # them), so a float conversion takes a slot only when that argument is a float.
         fp_apart = not _DEC_CTX["pe"] and _DEC_CTX["arch"] in ("x86_64", "aarch64")
         if not base.startswith("v"):                      # v*printf take a va_list
             scan = base.endswith("scanf")
-            for m in _CONV.finditer(fmt):
-                conv = m.group(3)
-                if conv == "%":
-                    continue
+            for m in (_SCONV if scan else _CONV).finditer(fmt):
                 extra = []
-                for star, what in ((m.group(1), T("width", "宽度")), (m.group(2), T("precision", "精度"))):
-                    if star == "*":
-                        if k < len(rest):
-                            extra.append("%s %s" % (what, rest[k]))
-                        k += 1
-                if conv == "m":                           # %m: strerror(errno), no argument
-                    continue
-                if fp_apart and not scan and conv in "eEfFgGaA":
-                    continue
-                if k < len(rest):
-                    val = rest[k]
+                if scan:
+                    supp, pos, conv = m.groups()
+                    if conv == "%" or supp:               # %*d reads and discards: no argument
+                        continue
+                else:
+                    pos, wid, prec, conv = m.groups()
+                    if conv == "%":
+                        continue
+                    for star, what in ((wid, T("width", "宽度")), (prec, T("precision", "精度"))):
+                        if star and star.startswith("*"):
+                            if k < len(rest):
+                                extra.append("%s %s" % (what, rest[k]))
+                            k += 1
+                    if conv == "m":                       # %m: strerror(errno), no argument
+                        continue
+                    if fp_apart and conv in "eEfFgGaA" and not pos and \
+                            not (k < len(rest_raw) and _is_float(rest_raw[k])):
+                        continue
+                i = int(pos) - 1 if pos else k
+                if 0 <= i < len(rest):
+                    val = rest[i]
                     if conv == "c" and not scan:
-                        iv = _arg_int(rest_raw[k])
+                        iv = _arg_int(rest_raw[i])
                         if iv is not None:
                             val = _dec_char(iv & 0xFF)
-                    binds.append("%s %s %s%s" % (m.group(0), "->" if scan else "=", val,
+                    spec = m.group(0).replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+                    binds.append("%s %s %s%s" % (spec, "->" if scan else "=", val,
                                                   " (%s)" % ", ".join(extra) if extra else ""))
-                k += 1
+                if not pos:
+                    k += 1
         if len(binds) > 4:
             binds = binds[:4] + ["..."]
         tail = " (%s)" % ", ".join(binds) if binds else ""
@@ -1920,7 +2164,8 @@ if _IN_IDA:
                 elif x == 1 or y == 1:
                     K["n"] = A[j] if x == 1 else A[i]
                 else:
-                    K["n"] = "%s x %s" % (A[i], A[j])
+                    par = lambda s: "(%s)" % s if " " in s and s != "..." else s     # (n + 1) x 16
+                    K["n"] = "%s x %s" % (par(A[i]), par(A[j]))
         elif base == "sbrk" and args:
             v = _arg_int(args[0])
             if v is not None:
@@ -1928,6 +2173,26 @@ if _IN_IDA:
             K["n"] = (T("query the program break", "查询当前堆顶") if v == 0 else
                       T("shrink the heap by %d bytes", "堆缩小 %d 字节") % -v if v is not None and v < 0 else
                       T("grow the heap by %s bytes", "堆扩大 %s 字节") % (A[0] if v is None else v))
+        elif base in ("lseek", "fseek") and len(args) >= 3:
+            # SEEK_CUR/SEEK_END offsets are relative: "to 0 (SEEK_END)" read like the start
+            off, wh = _arg_int(args[1]), _arg_int(args[2])
+            if off is not None:
+                try:
+                    bits = 8 * args[1].type.get_size()
+                except Exception:
+                    bits = 64
+                bits = bits if bits in (32, 64) else 64
+                off &= (1 << bits) - 1             # numval() may already be sign-extended
+                off = off - (1 << bits) if off >= 1 << (bits - 1) else off
+            where = {1: T("the current position", "当前位置"), 2: T("the end", "末尾")}.get(wh)
+            if where is None:
+                K["pos"] = A[1] if wh == 0 else "%s (%s)" % (A[1], A[2])
+            elif off == 0:
+                K["pos"] = where
+            elif off is None:
+                K["pos"] = "%s + %s" % (where, A[1])
+            else:
+                K["pos"] = "%s %s %d" % (where, "-" if off < 0 else "+", abs(off))
         elif base in ("open", "openat"):
             fi = 1 if base == "open" else 2
             fl = _arg_int(args[fi]) if fi < len(args) else None
@@ -2094,7 +2359,10 @@ if _IN_IDA:
                 if idx in by_idx and idx not in placed:
                     hit.append(by_idx[idx]); placed.add(idx)
             if hit:
-                sv[i].line = line + "  " + tail + "// " + "   ".join(dict.fromkeys(hit)) + off
+                shown = ida_lines.tag_remove(line)
+                hit = [h for h in dict.fromkeys(hit) if h not in shown]   # persisted already
+            if hit:
+                sv[i].line = line + "  " + tail + "// " + "   ".join(hit) + off
                 added += 1
         return added
 
@@ -2117,43 +2385,59 @@ if _IN_IDA:
 
     _hook_installed = [False]
 
+    def _refresh_pseudo_views():
+        # every open Pseudocode-X, not just the current widget (that is our panel
+        # when a button was clicked)
+        try:
+            import ida_hexrays as hr
+            hr.clear_cached_cfuncs()
+            for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                w = ida_kernwin.find_widget("Pseudocode-%s" % c)
+                vu = hr.get_widget_vdui(w) if w else None
+                if vu:
+                    vu.refresh_view(True)
+        except Exception:
+            pass
+
     def set_live_render(on):
         _RENDER_ON[0] = on
         if _HOOKS is None:
             return False
         if on and not _hook_installed[0]:
-            _HOOKS.hook(); _hook_installed[0] = True
-        try:
-            import ida_hexrays as hr
-            hr.clear_cached_cfuncs()
-            w = ida_kernwin.get_current_widget()
-            vu = hr.get_widget_vdui(w) if w else None
-            if vu:
-                vu.refresh_view(True)
-        except Exception:
-            pass
+            _hook_installed[0] = bool(_HOOKS.hook())      # retried next time if it failed
+        _refresh_pseudo_views()
         return True
 
     # ---------- persist pseudocode comments into the IDB (reversible) ----------
+    def _shown(cfunc, text):
+        sv = cfunc.get_pseudocode()
+        return sum(ida_lines.tag_remove(sv[i].line).count(text) for i in range(sv.size()))
+
     def _hx_put(cfunc, ea, text, func_ea):
+        """Persist one note as a user comment at the first item position of `ea` where
+        Hex-Rays actually prints it. A position that would leave it orphaned gets back
+        exactly what it held; other orphan comments (possibly the user's) are left alone."""
         import ida_hexrays as hr
         for itp in (hr.ITP_SEMI, hr.ITP_BLOCK1, hr.ITP_BLOCK2, hr.ITP_CASE, hr.ITP_COLON,
                     hr.ITP_CURLY1, hr.ITP_CURLY2, hr.ITP_BRACE1, hr.ITP_BRACE2, hr.ITP_ELSE):
             tl = hr.treeloc_t(); tl.ea = ea; tl.itp = itp
             try:
-                prev = cfunc.get_user_cmt(tl, hr.RETRIEVE_ONCE) or ""
+                prev = cfunc.get_user_cmt(tl, hr.RETRIEVE_ALWAYS) or ""
             except Exception:
                 prev = ""
             body = _strip_managed(prev)
-            newtext = text if not body else (text + "   | " + body)
+            newtext = text if not body else (text + " " + _JOIN + body)
+            if newtext == prev:
+                return True                   # already persisted here
+            before = _shown(cfunc, newtext)
             cfunc.set_user_cmt(tl, newtext)
-            cfunc.save_user_cmts()
             cfunc.refresh_func_ctext()
-            if not cfunc.has_orphan_cmts():
-                _undo["pcmts"].append((func_ea, ea, itp, prev))
+            if _shown(cfunc, newtext) > before:
+                cfunc.save_user_cmts()
+                _journal("pcmts", (func_ea, ea, itp), prev, newtext)
                 return True
-            cfunc.set_user_cmt(tl, prev)      # wrong spot: restore ONLY this one, try next
-            cfunc.del_orphan_cmts()
+            cfunc.set_user_cmt(tl, prev)      # not printed at this position: put it back
+            cfunc.refresh_func_ctext()
         return False
 
     def annotate_pseudo(func_ea=None):
@@ -2177,7 +2461,13 @@ if _IN_IDA:
             notes, _ = _collect_notes(cfunc)
             if not notes:
                 return 0
-            added = sum(1 for ea, txt in notes.items() if _hx_put(cfunc, ea, txt, func_ea))
+            was_live = _RENDER_ON[0]
+            _RENDER_ON[0] = False     # _hx_put counts printed copies; live copies would blur that
+            try:
+                cfunc.refresh_func_ctext()
+                added = sum(1 for ea, txt in notes.items() if _hx_put(cfunc, ea, txt, f.start_ea))
+            finally:
+                _RENDER_ON[0] = was_live
             cfunc.save_user_cmts(); cfunc.refresh_func_ctext()
             return added
         except Exception as ex:
@@ -2317,13 +2607,12 @@ if _IN_IDA:
             tagged = OPX + expr
             old = idc.get_cmt(ea, 0) or ""
             body = _strip_managed(old)
-            new = tagged if not body else (tagged + "  | " + body)
+            new = tagged if not body else (tagged + _JOIN + body)
             if new == old:
                 continue
-            if ea not in _undo["icmts"]:
-                _undo["icmts"][ea] = old
             try:
                 idc.set_cmt(ea, new, 0); n += 1
+                _journal("icmts", ea, old, new)
             except Exception:
                 pass
         return n
@@ -2337,9 +2626,14 @@ if _IN_IDA:
         return (not nm) or bool(_DUMMY_RE.match(nm))
 
     def do_undo():
-        nn = nc = ni = npc = 0
-        for ea, old in list(_undo["names"].items()):
+        """Revert what the plugin wrote. An item the user changed after the plugin wrote it
+        keeps the user's version: a renamed function or retyped prototype is left alone,
+        and an edited comment only loses the plugin's notes."""
+        nn = nc = ni = npc = nt = 0
+        for ea, (old, new) in list(_undo["names"].items()):
             try:
+                if (ida_funcs.get_func_name(ea) or "") != new:
+                    continue                          # renamed since: the user's name stays
                 if _is_dummy_name(old):
                     # empty name = let IDA regenerate sub_XXXX; SN_FORCE makes this fail
                     ok = ida_name.set_name(ea, "", ida_name.SN_NOWARN)
@@ -2349,43 +2643,50 @@ if _IN_IDA:
                     nn += 1
             except Exception:
                 pass
-        for ea, old in list(_undo["cmts"].items()):
+        for ea, (old, new) in list(_undo["cmts"].items()):
             try:
-                idc.set_func_cmt(ea, old or "", 1); nc += 1
+                cur = idc.get_func_cmt(ea, 1) or ""
+                idc.set_func_cmt(ea, (old or "") if cur == new else _strip_managed(cur), 1); nc += 1
             except Exception:
                 pass
-        for ea, old in list(_undo["icmts"].items()):
+        for ea, (old, new) in list(_undo["icmts"].items()):
             try:
-                idc.set_cmt(ea, old or "", 0); ni += 1
+                cur = idc.get_cmt(ea, 0) or ""
+                idc.set_cmt(ea, (old or "") if cur == new else _strip_managed(cur), 0); ni += 1
             except Exception:
                 pass
         if _undo["pcmts"]:
             try:
                 import ida_hexrays as hr
                 byfunc = {}
-                for (fea, ea, itp, old) in _undo["pcmts"]:
-                    byfunc.setdefault(fea, []).append((ea, itp, old))
+                for (fea, ea, itp), (old, new) in _undo["pcmts"].items():
+                    byfunc.setdefault(fea, []).append((ea, itp, old, new))
                 for fea, items in byfunc.items():
                     try:
                         cf = hr.decompile(fea)
                         if not cf:
                             continue
-                        for (ea, itp, old) in items:
+                        for (ea, itp, old, new) in items:
                             tl = hr.treeloc_t(); tl.ea = ea; tl.itp = itp
-                            cf.set_user_cmt(tl, old or ""); npc += 1
+                            cur = cf.get_user_cmt(tl, hr.RETRIEVE_ALWAYS) or ""
+                            cf.set_user_cmt(tl, (old or "") if cur == new else _strip_managed(cur)); npc += 1
                         cf.save_user_cmts(); cf.refresh_func_ctext()
                     except Exception:
                         pass
             except Exception:
                 pass
-        nt = 0
         try:
             import ida_nalt, ida_typeinf
-            for ea, prev in _undo["types"]:
-                if prev is None:
-                    ida_nalt.del_tinfo(ea)
-                else:
-                    ida_typeinf.apply_tinfo(ea, prev, ida_typeinf.TINFO_DEFINITE)
+            for ea, (prev, written) in list(_undo["types"].items()):
+                t = ida_typeinf.tinfo_t()
+                cur = str(t) if ida_nalt.get_tinfo(t, ea) else None
+                if cur != written:
+                    continue                          # retyped since: the user's type stays
+                ida_nalt.del_tinfo(ea)
+                if prev is not None:
+                    # a type IDA had only guessed must not come back as a user type
+                    ida_typeinf.apply_tinfo(ea, prev[0], ida_typeinf.TINFO_DEFINITE if prev[1]
+                                            else ida_typeinf.TINFO_GUESSED)
                 nt += 1
         except Exception:
             pass
@@ -2394,14 +2695,23 @@ if _IN_IDA:
             if f is not None and f.flags & ida_funcs.FUNC_LIB:
                 f.flags &= ~ida_funcs.FUNC_LIB
                 ida_funcs.update_func(f)
-        _undo["names"].clear(); _undo["cmts"].clear(); _undo["icmts"].clear(); _undo["pcmts"] = []
-        _undo["types"] = []; _undo["libflag"] = set()
+        for k in ("names", "cmts", "icmts", "pcmts", "types"):
+            _undo[k].clear()
+        _undo["libflag"] = set()
         try:
             ida_auto.auto_wait()
         except Exception:
             pass
-        return T("reverted: %d names, %d prototypes, %d func comments, %d insn comments, %d pseudocode comments.",
-                 "已撤回:%d 个函数名、%d 个原型、%d 处函数注释、%d 处指令注释、%d 处伪代码注释。") % (nn, nt, nc, ni, npc)
+        # the live notes are plugin output too: without this, notes that do not depend
+        # on names (SIMD, syscalls, canary reads) would stay on screen after Undo
+        was_live = _RENDER_ON[0]
+        _RENDER_ON[0] = False
+        _refresh_pseudo_views()
+        msg = T("reverted: %d names, %d prototypes, %d func comments, %d insn comments, %d pseudocode comments.",
+                "已撤回:%d 个函数名、%d 个原型、%d 处函数注释、%d 处指令注释、%d 处伪代码注释。") % (nn, nt, nc, ni, npc)
+        if was_live:
+            msg += T(" Live annotations paused until the next Run.", "实时注释已暂停,下次\"执行\"时恢复。")
+        return msg
 
     # ---------- dockable panel ----------
     _panel = None
@@ -2503,6 +2813,7 @@ if _IN_IDA:
                                             else T("+%d insn comments.", "+%d 处指令注释。") % n))
                 if not out:
                     out.append(T("(nothing selected)", "（什么都没勾）"))
+                set_live_render(self.cb_live.isChecked())     # resumes the notes Undo paused
                 self.log.append("\n".join(out))
                 if self._r:
                     self.result.setPlainText(_fmt(self._r))
@@ -2519,6 +2830,8 @@ if _IN_IDA:
                 return "%s: " % nm + T("+%d comment(s).", "+%d 处注释。") % n
 
             def on_undo(self):
+                # do_undo pauses the live notes; the checkbox keeps the preference and
+                # the next Run brings them back
                 self.log.append("[undo] " + do_undo())
 
             def OnClose(self, form):
