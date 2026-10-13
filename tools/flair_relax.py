@@ -173,7 +173,7 @@ def relax_relocs(line, arch):
                relaxable opcode gets its opcode (+ REX) bytes wildcarded too
                (mov -> lea / mov $imm, call|jmp * -> direct). No glibc 2.39 test
                function depended on it; it guards other archives."""
-    if not _is_pattern(line) or arch not in ("aarch64", "x86_64"):
+    if not _is_pattern(line) or arch not in ("aarch64", "x86_64", "i386"):
         return line, False
     f, head, crclen, tail_i, tail = _parse(line)
     segs = [(0, head)] + ([(32 + crclen, tail)] if tail else [])
@@ -190,6 +190,13 @@ def relax_relocs(line, arch):
             if seq[i:i + 4] != [".."] * 4 or ".." in (seq[i - 2], seq[i - 1]):
                 continue
             op, modrm = int(seq[i - 2], 16), int(seq[i - 1], 16)
+            if arch == "i386":
+                # R_386_GOT32X: `mov reg, [ebx + sym@GOT]` 8B 83 <disp32> becomes
+                # `mov reg, imm32` C7 C0 <imm32> (call/jmp/test/ALU forms likewise);
+                # the base+disp32 ModRM (mod=10, no SIB) is what pelf left literal.
+                if op in _X64_GOTX and modrm & 0xC0 == 0x80 and modrm & 7 != 4:
+                    pos.update((base + i - 2, base + i - 1))
+                continue
             if op in _X64_GOTX and modrm & 0xC7 == 0x05:
                 pos.update((base + i - 2, base + i - 1))
                 if i >= 3 and seq[i - 3] != ".." and 0x40 <= int(seq[i - 3], 16) <= 0x4F:

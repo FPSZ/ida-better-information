@@ -11,4 +11,4 @@ tools/fingerprint.json
 *.nam
 *.til
 _sigs/
-_sigs_build.log
+_*build.log

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build the per-architecture byte-pattern database (FLAIR .pat) for glibc / musl.
+"""Build the per-architecture byte-pattern database (FLAIR .pat) for glibc / musl / libgcc.
 
 For every (family, arch, version) it:
   1. picks a package from the Ubuntu pools (archive / ports / old-releases):
@@ -8,14 +8,17 @@ For every (family, arch, version) it:
        glibc i386    libc6-dev-i386_<v>_amd64.deb    -> usr/lib32/libc.a
        glibc aarch64 libc6-dev_<v>_arm64.deb         -> usr/lib/aarch64-linux-gnu/libc.a
        musl  *       musl-dev_<v>_<arch>.deb         -> usr/lib/musl/lib/libc.a
+       libgcc *      libgcc-<N>-dev / lib32gcc-<N>-dev -> libgcc.a, libgcc_eh.a, crtbeginT.o, crtend.o
      (newest Ubuntu revision for the DB; with --corpus the OLDEST one, so the
       regression corpus is linked against a different build than the DB)
+     libgcc patterns go to <out>/<arch>/libgcc/<N>.pat: they become FLIRT signatures
+     but stay out of the libc fingerprint, which only reads <out>/<arch>/*.pat
   2. extracts libc.a (+ crt objects) with pure Python (ar + tar.{xz,zst,gz})
   3. runs FLAIR `pelf` -> <out>/<arch>/<key>.pat     (key = "2.35" or "musl_1.2.5")
 
 usage:
   python tools/build-db.py --pelf <flair>/pelf.exe [--arch x86_64,i386,aarch64]
-                           [--family glibc,musl] [--out db] [--cache _cache]
+                           [--family glibc,musl,libgcc] [--out db] [--cache _cache]
   python tools/build-db.py --corpus --cache _cache      # only fetch + extract (oldest rev)
 
 Then: python tools/build-fingerprint.py _db tools/fingerprint.json
@@ -26,6 +29,10 @@ GLIBC_VERSIONS = ["2.19", "2.21", "2.23", "2.24", "2.26", "2.27", "2.28", "2.29"
                   "2.31", "2.32", "2.33", "2.34", "2.35", "2.36", "2.37", "2.38", "2.39",
                   "2.40", "2.41", "2.42", "2.43", "2.44"]
 MUSL_VERSIONS = ["1.1.24", "1.2.2", "1.2.3", "1.2.4", "1.2.5", "1.2.6"]
+# GCC majors shipped by Ubuntu 14.04 .. 25.10 (libgcc is linked into every static binary)
+GCC_VERSIONS = ["4.8", "5", "7", "9", "10", "11", "12", "13", "14", "15"]
+GCC_KEEP = ("libgcc.a", "libgcc_eh.a", "crtbeginT.o", "crtend.o")
+GCC_TRIPLE = {"x86_64": "x86_64-linux-gnu", "i386": "x86_64-linux-gnu", "aarch64": "aarch64-linux-gnu"}
 
 ARCHIVE = "http://archive.ubuntu.com/ubuntu/pool"
 PORTS = "http://ports.ubuntu.com/ubuntu-ports/pool"
@@ -92,12 +99,18 @@ def _rev_key(rev):
 def pick_deb(cache, family, arch, ver, oldest=False):
     """Return (url, debname) of the newest (or oldest) Ubuntu build of <ver>."""
     debarch, pkg, _, pools = ARCHES[arch]
-    if family == "musl":
+    if family == "libgcc":
+        pkg = ("lib32gcc-%s-dev" if arch == "i386" else "libgcc-%s-dev") % ver
+        sub = "main/g/gcc-%s" % ver
+        rx = re.compile(r"^%s_([^_]+)_%s\.deb$" % (re.escape(pkg), debarch))
+        ver = None
+    elif family == "musl":
         pkg, debarch, sub = "musl-dev", MUSL_DEB_ARCH[arch], "universe/m/musl"
         pools = (PORTS, OLD) if arch == "aarch64" else (ARCHIVE, OLD)
     else:
         sub = "main/g/glibc"
-    rx = re.compile(r"^%s_%s(?:-([^_]+))?_%s\.deb$" % (re.escape(pkg), re.escape(ver), debarch))
+    if family != "libgcc":
+        rx = re.compile(r"^%s_%s(?:-([^_]+))?_%s\.deb$" % (re.escape(pkg), re.escape(ver), debarch))
     cands = []
     for pool in pools:
         base = "%s/%s/" % (pool, sub)
@@ -109,7 +122,11 @@ def pick_deb(cache, family, arch, ver, oldest=False):
         for n in names:
             m = rx.match(n)
             if m:
-                cands.append((_rev_key(m.group(1) or ""), base + n, n))
+                key = _rev_key(m.group(1) or "")
+                if family == "libgcc":
+                    # prefer release builds (14.2.0-...) over pre-release snapshots (14-20240412-...)
+                    key = [1 if re.match(r"\d+\.\d", m.group(1)) else 0] + key
+                cands.append((key, base + n, n))
         if cands and pool != OLD:
             break                       # prefer the live pool; fall back to old-releases
     if not cands and family == "musl" and ver in ALPINE_REL:
@@ -141,7 +158,7 @@ def ar_members(blob):
         off += 60 + size + (size & 1)
 
 
-def extract(deb_path, libdir, outdir):
+def extract(deb_path, libdir, outdir, keep=KEEP):
     """Pull libc.a + crt objects out of a .deb / .apk into outdir. Returns list of files."""
     blob = open(deb_path, "rb").read()
     if deb_path.endswith(".apk"):               # Alpine: concatenated gzip'd tar segments
@@ -159,7 +176,7 @@ def extract(deb_path, libdir, outdir):
             p = m.name.lstrip("./")
             if not m.isfile() or os.path.dirname(p) != libdir.strip("/"):
                 continue
-            if os.path.basename(p) in KEEP:
+            if os.path.basename(p) in keep:
                 dst = os.path.join(outdir, os.path.basename(p))
                 with open(dst, "wb") as f:
                     f.write(tf.extractfile(m).read())
@@ -167,7 +184,9 @@ def extract(deb_path, libdir, outdir):
     return got
 
 
-def libdir_for(family, arch):
+def libdir_for(family, arch, ver=None):
+    if family == "libgcc":
+        return "usr/lib/gcc/%s/%s%s" % (GCC_TRIPLE[arch], ver, "/32" if arch == "i386" else "")
     if family == "musl":                        # Debian/Ubuntu musl-dev layout (.apk handled in extract)
         return "usr/lib/%s-linux-musl" % arch
     return ARCHES[arch][2]
@@ -176,7 +195,7 @@ def libdir_for(family, arch):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arch", default="x86_64,i386,aarch64")
-    ap.add_argument("--family", default="glibc,musl")
+    ap.add_argument("--family", default="glibc,musl,libgcc")
     ap.add_argument("--versions", default="", help="comma list to restrict versions")
     ap.add_argument("--pelf", default=os.environ.get("FLAIR_PELF", ""))
     ap.add_argument("--out", default="_db")
@@ -187,14 +206,15 @@ def main():
     only = set(v for v in args.versions.split(",") if v)
     ok, fail = [], []
     for family in args.family.split(","):
-        vers = GLIBC_VERSIONS if family == "glibc" else MUSL_VERSIONS
+        vers = {"glibc": GLIBC_VERSIONS, "musl": MUSL_VERSIONS, "libgcc": GCC_VERSIONS}[family]
         for arch in args.arch.split(","):
             for ver in vers:
                 if only and ver not in only:
                     continue
-                key = ver if family == "glibc" else "musl_" + ver
+                key = {"glibc": ver, "musl": "musl_" + ver, "libgcc": "libgcc_" + ver}[family]
                 tag = "%s/%s" % (arch, key)
-                pat = os.path.join(args.out, arch, key + ".pat")
+                pat = os.path.join(args.out, arch, *(["libgcc", ver + ".pat"] if family == "libgcc"
+                                                     else [key + ".pat"]))
                 if not args.corpus and os.path.exists(pat) and os.path.getsize(pat) > 0:
                     log("skip %-18s (exists)" % tag); ok.append(tag); continue
                 url, name = pick_deb(args.cache, family, arch, ver, oldest=args.corpus)
@@ -206,15 +226,23 @@ def main():
                         log("get  %-18s %s" % (tag, name))
                         fetch(url, deb)
                     xdir = os.path.join(args.cache, "x", os.path.splitext(name)[0])
-                    files = extract(deb, libdir_for(family, arch), xdir)
-                    liba = os.path.join(xdir, "libc.a")
-                    if not os.path.exists(liba):
-                        raise RuntimeError("libc.a not found in package")
+                    if family == "libgcc":
+                        files = extract(deb, libdir_for(family, arch, ver), xdir, GCC_KEEP)
+                        inputs = [f for k in GCC_KEEP for f in files if os.path.basename(f) == k]
+                    else:
+                        files = extract(deb, libdir_for(family, arch), xdir)
+                        inputs = [os.path.join(xdir, "libc.a")]
+                    if not inputs or not os.path.exists(inputs[0]):
+                        raise RuntimeError("%s not found in package" % ("libgcc.a" if family == "libgcc" else "libc.a"))
                     if args.corpus:
                         log("ok   %-18s %s (%d files)" % (tag, xdir, len(files))); ok.append(tag); continue
                     os.makedirs(os.path.dirname(pat), exist_ok=True)
-                    r = subprocess.run([args.pelf, liba, pat], capture_output=True, text=True)
-                    if r.returncode != 0 or not os.path.exists(pat) or os.path.getsize(pat) == 0:
+                    if os.path.exists(pat):
+                        os.remove(pat)
+                    for i, inp in enumerate(inputs):         # -a: append every input to one .pat
+                        r = subprocess.run([args.pelf] + (["-a"] if i else []) + [inp, pat],
+                                           capture_output=True, text=True)
+                    if not os.path.exists(pat) or os.path.getsize(pat) == 0:
                         raise RuntimeError("pelf failed: " + (r.stdout + r.stderr)[-400:])
                     n = sum(1 for _ in open(pat, errors="ignore"))
                     log("ok   %-18s %d patterns  (%s)" % (tag, n, name)); ok.append(tag)

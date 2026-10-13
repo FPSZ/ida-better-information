@@ -17,7 +17,8 @@ and FLIRT would stamp that name on every function it fails to match otherwise.
 Collisions (.exc) are resolved by excluding the conflicting modules; in libc they
 are almost all same-byte aliases (htons/ntohs, atoi/atol).
 
-Output names:  glibc_<ver>_<arch>.sig   musl_<ver>_<arch>.sig
+Output names:  glibc_<ver>_<arch>.sig   musl_<ver>_<arch>.sig   libgcc_<gcc major>_<arch>.sig
+(libgcc.a + libgcc_eh.a + crtbeginT.o + crtend.o: the GCC runtime every static binary carries)
 FLIRT keys signatures by directory, not by the .sig processor byte (IDA's own
 android_arm.sig also reports processor 0), so x86 sigs install to sig/pc and
 AArch64 sigs to sig/arm.
@@ -108,7 +109,7 @@ def main():
     ap.add_argument("--sigmake", default=os.environ.get("FLAIR_SIGMAKE", ""))
     ap.add_argument("--db", default="_db")
     ap.add_argument("--arch", default="x86_64,i386,aarch64")
-    ap.add_argument("--family", default="glibc,musl")
+    ap.add_argument("--family", default="glibc,musl,libgcc")
     ap.add_argument("--versions", default="")
     ap.add_argument("--out", default="_sigs")
     ap.add_argument("--install", default="", help="IDA install dir: copy sigs into sig/{pc,arm}")
@@ -129,10 +130,14 @@ def main():
     for arch in args.arch.split(","):
         tls = set(_TLS_FALLBACK)
         tls |= flair_relax.tls_names(glob.glob(os.path.join(args.cache, "x", _LIBC_GLOB[arch], "libc.a")))
-        for pat in sorted(glob.glob(os.path.join(args.db, arch, "*.pat"))):
-            key = os.path.splitext(os.path.basename(pat))[0]      # "2.35" or "musl_1.2.5"
-            fam = "musl" if key.startswith("musl") else "glibc"
-            ver = key.split("_", 1)[-1] if fam == "musl" else key
+        pats = sorted(glob.glob(os.path.join(args.db, arch, "*.pat"))) +             sorted(glob.glob(os.path.join(args.db, arch, "libgcc", "*.pat")))
+        for pat in pats:
+            key = os.path.splitext(os.path.basename(pat))[0]      # "2.35", "musl_1.2.5", libgcc/"13"
+            if os.path.basename(os.path.dirname(pat)) == "libgcc":
+                fam, ver = "libgcc", key
+            else:
+                fam = "musl" if key.startswith("musl") else "glibc"
+                ver = key.split("_", 1)[-1] if fam == "musl" else key
             if fam not in want_fam or (only and ver not in only):
                 continue
             outdir = os.path.join(args.out, arch)

@@ -17,49 +17,52 @@ English · [简体中文](README.zh-CN.md)
   <source srcset="docs/demo.avif" type="image/avif">
   <img src="docs/demo-poster.png" alt="IDA Better Reverse identifying glibc 2.39 in a stripped static binary, naming its functions and annotating the pseudocode" width="100%">
 </picture>
-<p align="center"><sub>IDA Pro 9.1, stripped static x86-64 binary, one click. <a href="https://github.com/FPSZ/ida-better-reverse/releases/download/v2.1.0/demo.mp4">MP4, 1080p60</a></sub></p>
+<p align="center"><sub>IDA Pro 9.1, stripped static x86-64 binary, one click. <a href="https://github.com/FPSZ/ida-better-reverse/releases/download/v2.2.0/demo.mp4">MP4, 1080p60</a></sub></p>
 
 IDA Better Reverse is an IDA Pro plugin for statically linked, stripped ELF binaries, which
 is what most CTF reversing and pwn challenges and a lot of Linux malware look like. It works
 out which C runtime build was linked in (glibc or musl, down to the release) and names the
-library functions with FLIRT signatures generated for that exact build. It also restores their
-prototypes and annotates the Hex-Rays output with what each libc call and system call does,
-with constants decoded. The plugin is a single Python file with its data embedded. The same
+library functions with FLIRT signatures generated for that exact build and for the GCC runtime
+linked next to it. It also restores their prototypes and annotates the Hex-Rays output with
+what each libc call and system call does, with constants decoded. The plugin is a single Python file with its data embedded. The same
 file runs as a command-line tool without IDA.
 
 ## Example
 
-Hex-Rays on the stripped binary from the recording above:
+The stripped binary from the recording, opened fresh in IDA. This is part of `main` in Hex-Rays:
 
 ```c
   sub_405110(off_4AA6D0, 0, 2, 0);
   sub_404600(14, sub_4019C0);
   sub_4195B0(30);
-  v5 = sub_41A310(0, 0, 0, 0, v3, v4, v20[0]);
+  v2 = sub_41A310(0, 0, 0, 0, v0, v1, v17[0]);
   result = 1;
-  if ( v5 >= 0 )
+  if ( v2 >= 0 )
   {
-    v7 = sub_419640("flag.txt", 0, v20[0]);
-    sub_419760(v7, v20, 64);
-    v8 = sub_41A1F0(0);
+    v4 = sub_419640("flag.txt", 0, v17[0]);
+    sub_419760(v4, v17, 64);
+    v5 = sub_41A1F0(0);
 ```
 
-After **Run** (detect, apply signature, apply prototypes). The comments are drawn by a
-decompiler hook as the function is printed and are not stored in the database:
+After one **Run** (detect, apply signatures, apply prototypes), 903 functions are named. The
+comments are drawn by a decompiler hook as the function is printed and are not stored in the
+database:
 
 ```c
+  v13 = __readfsqword(0x28u);  // op: read fs:0x28 stack canary
   IO_setvbuf((FILE *)stream, 0, 2, 0);  // libc: stream buffering: _IONBF (unbuffered)
   _bsd_signal(14, (__sighandler_t)sub_4019C0);  // libc: on SIGALRM -> sub_4019C0
   alarm(0x1Eu);  // libc: SIGALRM in 30s
-  v3 = ptrace(PTRACE_TRACEME, 0, 0, 0);  // libc: ptrace PTRACE_TRACEME
+  v0 = ptrace(PTRACE_TRACEME, 0, 0, 0);  // libc: ptrace PTRACE_TRACEME
   result = 1;
-  if ( v3 >= 0 )
+  if ( v0 >= 0 )
   {
     fd = _libc_open64("flag.txt", 0);  // libc: open "flag.txt" (O_RDONLY)
     _libc_read(fd, buf, 0x40u);  // libc: read 64 bytes from fd
-    v6 = _mmap64(0, 0x1000u, 7, 34, -1, 0);  // libc: map 4096 bytes, PROT_READ|PROT_WRITE|PROT_EXEC [RWX]
+    v3 = _mmap64(0, 0x1000u, 7, 34, -1, 0);  // libc: map 4096 bytes, PROT_READ|PROT_WRITE|PROT_EXEC [RWX], MAP_PRIVATE|MAP_ANONYMOUS
     ...
-    v11 = syscall(39, buf_1);  // sys: getpid (#39)
+    v8 = syscall(39, buf_1);  // sys: getpid() (#39)
+    __printf_chk(2, (unsigned int)"pid %ld\n", v8, v9, v10, v11, buf[0]);  // libc: printf "pid %ld\n" (%ld = v8)
 ```
 
 From the command line, on a 2024 强网杯 challenge whose ELF header was tampered with to
@@ -79,7 +82,7 @@ version ranking (hit-rate  hits/anchors):
   glibc 2.31     16.7%  212/1272  #####
 ------------------------------------------------------------
 verdict   : glibc 2.35   confidence = high
-  - ELF ident bytes tampered: EI_CLASS/EI_DATA claim 32-bit big-endian, header decodes as 64-bit little-endian x86_64.
+  - ELF ident bytes tampered: EI_CLASS/EI_DATA claim 32-bit big-endian, header decodes as 64-bit little-endian x86_64 (to load it in IDA, set file byte 4 to 2 and byte 5 to 1).
   - toolchain: gcc 11.4.0 (Ubuntu 11.4.0-1ubuntu1~22.04)
   - static (x86_64): function byte-anchor match; clear leader = most likely build.
   - lead over #2: 3.8 pts (x1.17).
@@ -132,20 +135,30 @@ static link changes more than that:
 | x86-64 | `mov rcx, [rip+__libc_errno@gottpoff]` &nbsp;`48 8B 0D` | `mov rcx, -0x40` &nbsp;`48 C7 C1` | REX, opcode, ModRM |
 | AArch64 | `adrp x0, sym` &nbsp;pattern `......90` | `600400F0` | top byte (`immlo`, bits 29–30) |
 | AArch64 | `ldr x0, [x0, #:lo12:sym]` &nbsp;pattern `....40F9` | `002446F9` | byte holding the high bits of `imm12` |
+| i386 | `mov eax, [ebx+sym@GOT]` &nbsp;`8B 83` | `mov eax, imm32` &nbsp;`C7 C0` | opcode, ModRM |
 
 The first row is the initial-exec → local-exec TLS relaxation, which reaches most syscall
 wrappers (`read`, `mmap`, `ptrace`, `alarm`, …) through `errno`. The AArch64 rows are relocated
 immediates that `pelf` wildcards only partially, so the pattern matches only when those bits
-happen to be zero. [`tools/flair_relax.py`](tools/flair_relax.py) rewrites the patterns
-before `sigmake` runs:
+happen to be zero. The i386 row is `R_386_GOT32X` relaxation, which turns GOT loads into
+immediates in functions such as `getenv` and the string-function IFUNC resolvers.
+[`tools/flair_relax.py`](tools/flair_relax.py) rewrites the patterns before `sigmake` runs:
 - it wildcards the instruction bytes around references to the archive's `STT_TLS` symbols
   and drops the CRC when one of them falls inside the CRC range;
-- it wildcards every AArch64 instruction word that `pelf` left partly wildcarded.
+- it wildcards every AArch64 instruction word that `pelf` left partly wildcarded;
+- it wildcards the opcode and ModRM of i386 base+disp32 loads, calls and ALU operations
+  whose displacement is relocated.
 
 [`tools/make-sigs.py`](tools/make-sigs.py) then removes patterns with fewer than 10 fixed bytes. One
 of them, the AArch64 `_dl_start` pattern, is a bare `stp x29, x30, [sp,#-16]!; mov x29, sp`
 prologue that FLIRT would otherwise stamp on unrelated functions. Byte-identical modules
 (`strtol`/`strtoul`, `fseek`/`fseeko`) are excluded rather than guessed. Precision comes first.
+
+A static binary also carries the GCC runtime: the unwinder from `libgcc_eh`, integer helpers
+such as `__udivti3` from `libgcc`, and `frame_dummy` and friends from `crtbeginT.o`. These are
+signed separately from Ubuntu's `libgcc-N-dev` packages for GCC 4.8 to 15. The GCC version comes
+from `.comment`, or from the glibc release's default compiler when `.comment` is stripped, and
+its signature is applied together with the libc one.
 
 ### Types and annotations
 
@@ -154,14 +167,20 @@ Once functions have names, their prototypes are pulled from IDA's own type libra
 displayed and attaches notes to call sites by ctree item. Fortified `__*_chk` and
 `__isoc99_*` variants are read as the call they wrap, and the arguments are decoded with the
 call's actual values:
-- `open` flags, `mmap`/`mprotect` protections (with an RWX warning), signal numbers;
-- `ptrace`/`prctl` requests, socket families, `lseek` whence, standard fds;
-- format strings, and `syscall(n)` resolved through per-architecture kernel tables.
+- `open` flags and creation mode, `mmap` protections and flags (RWX is flagged), signals and
+  `SIG_DFL`/`SIG_IGN`, with the values each target actually uses (x86, ARM, MIPS and the
+  Windows CRT differ);
+- `ptrace`, `prctl`, `fcntl` and `futex` requests, socket families and types, `lseek` whence,
+  standard file descriptors;
+- printf/scanf formats with every conversion bound to its argument (`%zu = n`), and a
+  warning when a format is not a literal;
+- `syscall(n)`, named from per-architecture kernel tables, with its arguments decoded;
+- nested MMX/SSE/AVX intrinsics folded into one expression, rotates included:
+  `_mm_or_si128(_mm_slli_epi32(x, 12), _mm_srli_epi32(x, 20))` reads `rotl(x, 12) (per 32b)`.
 
 The notes follow renames and language changes and write nothing. Persisting them, and every
 other change the plugin makes (names, types, library flags, comments), goes through an undo
-journal. On the demo binary, no name, type or library flag differs from the original after
-**Undo**.
+journal, so **Undo** returns the database to its earlier state (see the audit below).
 
 ## Evaluation
 
@@ -171,26 +190,25 @@ on an AMD Ryzen AI MAX+ 395.
 ### Function naming against ground truth
 
 Two small C programs were built with Ubuntu 24.04's GCC 13.3 against glibc 2.39 using
-`-static`, then stripped. IDA analysed the stripped binary and one signature was applied.
+`-static`, then stripped. IDA analysed the stripped binary and the signatures were applied.
 Every function IDA marked as library code was compared with all symbols at that address in
 the unstripped build; aliases such as `read`/`__read`/`__libc_read` count as correct, and
-IDA's placeholder names (`unknown_libname_N`) do not count as named. The baseline is the same
-pipeline without the pattern rewriting and the weak-pattern filter.
+IDA's placeholder names (`unknown_libname_N`) do not count as named. The baseline is a plain
+`pelf` → `sigmake` signature for the same glibc, with the same collision handling.
 
 | Target | Signatures | Named | Correct | Precision | Coverage¹ |
 |---|---|--:|--:|--:|--:|
 | x86-64 | `pelf` → `sigmake` | 810 | 804 | 99.3% | 82.4% |
-| x86-64 | **this project** | **856** | **855** | **99.9%** | **86.9%** |
+| x86-64 | **this project** | **902** | **901** | **99.9%** | **91.2%** |
 | i386 | `pelf` → `sigmake` | 751 | 750 | 99.9% | 79.4% |
-| i386 | **this project** | **750** | **749** | **99.9%** | **79.3%** |
+| i386 | **this project** | **859** | **858** | **99.9%** | **90.8%** |
 | AArch64 | `pelf` → `sigmake` | 330 | 294 | 89.1% | 37.3% |
-| AArch64 | **this project** | **501** | **495** | **98.8%** | **62.7%** |
+| AArch64 | **this project** | **588** | **582** | **99.0%** | **73.8%** |
 
 <sub>¹ Correctly named ÷ functions that have a symbol in the unstripped build (976–984,
-945 and 789). The denominator includes crt and libgcc code (`_start`, `frame_dummy`,
-the unwinder) that no libc signature can name, and byte-identical modules that are
-deliberately left unnamed. On i386 the rewriting changed no patterns, so its row only shows
-the effect of the weak-pattern filter.</sub>
+945 and 789). The denominator includes code no signature covers (`_start`, `main` and the
+program's own functions) and byte-identical modules that are deliberately left unnamed.
+"This project" is the libc signature after pattern rewriting plus the libgcc signature.</sub>
 
 ### Runtime identification on CTF binaries
 
@@ -207,12 +225,26 @@ challenges, 63.6 MB in total:
 None was misclassified. The three ground-truth binaries above (x86-64, i386, AArch64) are
 all identified as glibc 2.39 with high confidence.
 
+### Pipeline audit
+
+Every change is checked by running the whole pipeline headless (idalib) on 36 configurations:
+- the 19 files above;
+- static and dynamic test programs for x86-64, i386 and AArch64, in both UI languages;
+- the ground-truth binaries.
+
+Each run detects the runtime, applies signatures and prototypes, and decompiles up to 860
+functions with live notes. It then persists notes and disassembly comments and undoes
+everything. In the latest run no step raised an exception, and **Undo** left behind no name,
+type, comment or library flag that the plugin had written. The only differences after Undo were
+on three binaries: function types that Hex-Rays inferred for the programs' own functions while
+decompiling, and on one of them the argument comments IDA derives from those types.
+
 ### Speed
 
 | Run | Input | Time |
 |---|---|--:|
-| CLI | `emu`, static x86-64, 12.7 MB | 0.57 s |
-| CLI | `iked`, static x86-64, 4.5 MB | 0.43 s |
+| CLI | `emu`, static x86-64, 12.7 MB | 0.58 s |
+| CLI | `iked`, static x86-64, 4.5 MB | 0.42 s |
 | CLI | `butterfly`, static x86-64, 0.7 MB | 0.23 s |
 | CLI | all 19 binaries above, 63.6 MB | 2.0 s |
 | In IDA | `emu`, 13,861 functions | 0.54 s |
@@ -222,7 +254,8 @@ all identified as glibc 2.39 with high confidence.
 1. Download `ida_better_reverse.py` and `ibr-sigs.zip` from the
    [latest release](https://github.com/FPSZ/ida-better-reverse/releases/latest).
 2. Copy `ida_better_reverse.py` into your IDA user directory's `plugins/`, then unzip
-   `ibr-sigs.zip` into that same user directory (it contains `sig/pc/` and `sig/arm/`):
+   `ibr-sigs.zip` into that same user directory. It holds 117 signatures (glibc, musl and
+   libgcc) under `sig/pc/` and `sig/arm/`:
 
    | OS | IDA user directory |
    |---|---|
@@ -242,10 +275,10 @@ The panel shows the detection result with the candidate ranking and offers:
 | Option | Effect |
 |---|---|
 | **Live annotations** | Decompiler notes, rendered on display, nothing written (on by default) |
-| **Apply FLIRT signature** | Apply the signature for the detected build plus libc prototypes |
+| **Apply FLIRT signature** | Apply the signatures for the detected libc build and its GCC runtime, plus prototypes |
 | **Describe libc functions** | A one-line description as the function comment of each named libc function |
 | **Persist comments** | Write the current function's notes into the database |
-| **Math / SIMD in disassembly** | `xor eax, ebx` → `eax = eax ^ ebx`, SSE/AVX intrinsics spelled out |
+| **Math / SIMD in disassembly** | The current function's arithmetic as comments: `xor eax, ebx` → `eax = eax ^ ebx`, `ADD X0, X2, X20` → `X0 = X2 + X20` (ARM, AArch64 and MIPS), SSE/AVX lanes spelled out |
 
 **Detect** ranks candidates, **Run** applies the checked options, and **Undo** reverts
 everything the plugin wrote. The UI and the notes are available in English and Chinese.
@@ -256,6 +289,7 @@ As a command-line tool, with no IDA required:
 $ python ida_better_reverse.py ./target                  # ranked candidates and verdict
 $ python ida_better_reverse.py ./target --top 8 --json   # machine-readable
 $ python ida_better_reverse.py ./target --arch aarch64   # override a broken e_machine
+$ python ida_better_reverse.py ./target --repair out     # fix tampered EI_CLASS/EI_DATA so IDA can load it
 ```
 
 ## Rebuilding the data
@@ -264,9 +298,9 @@ Everything is generated from public distribution packages. You need Hex-Rays FLA
 (`pelf`, `sigmake`):
 
 ```console
-python tools/build-db.py --pelf <flair>/pelf      # libc6-dev / musl-dev packages -> _db/<arch>/*.pat
+python tools/build-db.py --pelf <flair>/pelf      # libc6-dev, musl-dev, libgcc-N-dev -> _db/<arch>/
 python tools/build-fingerprint.py                 # -> tools/fingerprint.bin
-python tools/make-sigs.py --sigmake <flair>/sigmake --install <IDA dir>   # -> _sigs/, 87 .sig files
+python tools/make-sigs.py --sigmake <flair>/sigmake --install <IDA dir>   # -> _sigs/, 117 .sig files
 python tools/gen-syscalls.py > tools/syscalls.json   # optional, needs Linux kernel headers
 python tools/embed-fingerprint.py                 # -> ida_better_reverse.py
 ```
@@ -275,13 +309,31 @@ python tools/embed-fingerprint.py                 # -> ida_better_reverse.py
 
 - Static identification needs the build in the database. Libraries compiled by other
   distributions with different flags match less well.
-- Only x86-64, i386 and AArch64 are covered; MIPS, 32-bit ARM and RISC-V are not.
+- Runtime identification and the signatures cover x86-64, i386 and AArch64 only. On other
+  processors, such as the static MIPS binary in the audit, the decompiler annotations still
+  work but no runtime is identified and nothing is named.
 - Dynamic binaries get a lower bound, not an exact build; the build-id can pin the exact
   build with [libc.rip](https://libc.rip).
 - Library functions that are byte-identical to another one are left unnamed.
+- On AArch64, a function inside a multi-function object module is named only when the module's
+  first function matches, so coverage there is lower (74% on the test binary).
 
 ## License
 
-[MIT](LICENSE). The fingerprints and signatures are derived from Ubuntu and Alpine glibc/musl
-packages with Hex-Rays FLAIR. This project builds on the community FLIRT collection
-[`push0ebp/sig-database`](https://github.com/push0ebp/sig-database).
+The code is [MIT](LICENSE). The fingerprints and signatures are generated with Hex-Rays FLAIR
+from public Ubuntu and Alpine packages:
+
+| Library | Packages | License |
+|---|---|---|
+| glibc | `libc6-dev`, `libc6-dev-i386` | LGPL-2.1-or-later |
+| musl | `musl-dev` | MIT |
+| GCC runtime | `libgcc-N-dev`, `lib32gcc-N-dev` | GPL-3.0 with the GCC Runtime Library Exception |
+
+They hold function names, checksums and short byte patterns. The signatures keep the first 32
+bytes of each function with relocated bytes wildcarded, plus a few distinguishing bytes where
+two functions would otherwise collide. The fingerprint keeps one 10–24-byte run per function.
+No library or complete function is redistributed. The downloaded packages and the intermediate
+`.pat` files are not part of this repository. FLAIR is not
+included either; rebuilding the data needs your own copy. Inspired by the community FLIRT
+collection [`push0ebp/sig-database`](https://github.com/push0ebp/sig-database), whose data is
+not used here.

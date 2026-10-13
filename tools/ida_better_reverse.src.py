@@ -34,7 +34,7 @@ License: MIT
 """
 import os, re, sys, json, gzip, base64, struct, argparse
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # ======================================================================
 #  Embedded fingerprint database  (gzip + base64 of fingerprint.bin)
@@ -195,9 +195,11 @@ def _elf_layout(data):
         if arch and typ_ok:
             bits = _ARCH_BITS.get(arch, 64 if is64 else 32)
             note = ("ELF ident bytes tampered: EI_CLASS/EI_DATA claim %d-bit %s-endian, "
-                    "header decodes as %d-bit %s-endian %s"
+                    "header decodes as %d-bit %s-endian %s (to load it in IDA, set file "
+                    "byte 4 to %d and byte 5 to %d)"
                     % (64 if is64 else 32, "little" if en == "<" else "big",
-                       bits, "little" if e == "<" else "big", arch))
+                       bits, "little" if e == "<" else "big", arch,
+                       2 if bits == 64 else 1, 1 if e == "<" else 2))
             return bits == 64, e, note
     return is64, en, None
 
@@ -458,6 +460,14 @@ def detect_elf(data, arch_hint=None, force=None, top=5, present_hook=None):
             present = _present_in_buffer(data, index)
     ranking, scored = _score(present, vers, top)
     r["ranking"] = [(v, round(s, 3), h, n) for (v, s, h, n) in ranking]
+    if not present:
+        # nothing matched at all: never promote an all-zero ranking to a verdict
+        r["ranking"] = []
+        r["best"] = "static %s (no libc code recognised)" % r["arch"]
+        r["confidence"] = "low"
+        r["notes"].append("no function-byte anchor matched: packed/encrypted code, a libc "
+                          "build outside the DB, or no code loaded.")
+        return r
     if scored:
         bestver, bests = scored[0][0], scored[0][1]
         second = scored[1][1] if len(scored) > 1 else 0.0
@@ -544,10 +554,24 @@ def _cli():
     ap.add_argument("--arch", choices=["x86_64", "i386", "aarch64"], help="override the detected architecture")
     ap.add_argument("--top", type=int, default=5, help="how many candidates to rank (default 5)")
     ap.add_argument("--json", action="store_true", help="emit the raw result as JSON")
+    ap.add_argument("--repair", metavar="OUT",
+                    help="write a copy with tampered ELF ident bytes (EI_CLASS/EI_DATA) fixed")
     args = ap.parse_args()
     if not args.binary:
         print("IDA Better Reverse v%s" % __version__)
         ap.print_help(); sys.exit(1)
+    if args.repair:
+        data = bytearray(open(args.binary, "rb").read())
+        if data[:4] != b"\x7fELF":
+            sys.exit("not an ELF file")
+        is64, en, note = _elf_layout(bytes(data))
+        if not note:
+            sys.exit("ELF ident bytes are consistent; nothing to repair")
+        data[4], data[5] = (2 if is64 else 1), (1 if en == "<" else 2)
+        with open(args.repair, "wb") as f:
+            f.write(data)
+        print("%s.\nwrote %s (bytes 4-5 = %02X %02X)" % (note, args.repair, data[4], data[5]))
+        return
     force = "static" if args.static else ("dynamic" if args.dynamic else None)
     r = detect(path=args.binary, force=force, top=args.top, arch_hint=args.arch)
     if args.json:
@@ -737,22 +761,25 @@ if _IN_IDA:
      "setvbuf":("{0} buffering: {2}","{0} 缓冲方式:{2}"),
      "fopen":("open {0} (mode {1})","打开 {0}(模式 {1})"),
      "freopen":("reopen {0} (mode {1})","重开 {0}(模式 {1})"),
-     "open":("open {0} ({1})","打开 {0}({1})"), "openat":("openat {1} ({2})","相对打开 {1}({2})"),
-     "close":("close fd {0}","关闭 fd {0}"),
+     "open":("open {0} ({1}{mode})","打开 {0}({1}{mode})"), "openat":("openat {1} ({2}{mode})","相对打开 {1}({2}{mode})"),
+     "close":("close {0}","关闭 {0}"), "fclose":("close stream {0}","关闭文件流 {0}"),
      "read":("read {2} bytes from {0}","从 {0} 读 {2} 字节"),
      "write":("write {2} bytes to {0}","向 {0} 写 {2} 字节"),
      "lseek":("seek {0} to {1} ({2})","{0} 定位到 {1} ({2})"),
-     "fread":("read {1}x{2} bytes -> {0}","读 {1}x{2} 字节 -> {0}"),
-     "fwrite":("write {1}x{2} bytes from {0}","写 {1}x{2} 字节(来自 {0})"),
+     "fread":("read {n} bytes -> {0}","读 {n} 字节 -> {0}"),
+     "fwrite":("write {n} bytes from {0}","写 {n} 字节(来自 {0})"),
      "fseek":("seek {0} to {1}","{0} 定位到 {1}"), "fgets":("read a line -> {0} (max {1})","读一行 -> {0}(上限 {1})"),
-     "malloc":("alloc {0} bytes","分配 {0} 字节"), "calloc":("alloc {0}x{1}, zeroed","分配 {0}x{1} 并清零"),
+     "malloc":("alloc {0} bytes","分配 {0} 字节"), "calloc":("alloc {n} bytes, zeroed","分配 {n} 字节并清零"),
      "realloc":("resize {0} -> {1} bytes","把 {0} 重分配为 {1} 字节"), "free":("free {0}","释放 {0}"),
      "aligned_alloc":("alloc {1} bytes, {0}-aligned","分配 {1} 字节,{0} 对齐"),
      "memcpy":("copy {2} bytes {1} -> {0}","复制 {2} 字节 {1} -> {0}"),
      "memmove":("move {2} bytes {1} -> {0}","搬移 {2} 字节 {1} -> {0}"),
      "memset":("fill {0} with {1}, {2} bytes","把 {0} 填成 {1},共 {2} 字节"),
      "memcmp":("compare {2} bytes {0},{1}","比较 {2} 字节 {0},{1}"),
-     "mmap":("map {1} bytes, {2}","映射 {1} 字节,{2}"), "mprotect":("protect {1} bytes @ {0}: {2}","{0} 起 {1} 字节权限: {2}"),
+     "mmap":("map {1} bytes, {2}, {3}","映射 {1} 字节,{2},{3}"), "mprotect":("protect {1} bytes @ {0}: {2}","{0} 起 {1} 字节权限: {2}"),
+     "munmap":("unmap {1} bytes @ {0}","解除映射 {0} 起 {1} 字节"),
+     "mremap":("remap {0}: {1} -> {2} bytes","重映射 {0}: {1} -> {2} 字节"),
+     "sbrk":("{n}","{n}"), "brk":("set program break to {0}","把堆顶设为 {0}"),
      "strlen":("length of {0}","{0} 的长度"), "strcpy":("copy {1} -> {0}","复制 {1} -> {0}"),
      "strncpy":("copy {2} bytes {1} -> {0}","复制 {2} 字节 {1} -> {0}"),
      "strcat":("append {1} to {0}","把 {1} 接到 {0}"), "strcmp":("compare {0}, {1}","比较 {0}, {1}"),
@@ -760,21 +787,23 @@ if _IN_IDA:
      "strstr":("find {1} in {0}","在 {0} 里找 {1}"), "strchr":("find char {1} in {0}","在 {0} 里找字符 {1}"),
      "strtol":("{0} -> long (base {2})","{0} 转 long(进制 {2})"),
      "atoi":("{0} -> int","{0} 转 int"), "atol":("{0} -> long","{0} 转 long"),
-     "printf":("printf {0}","按 {0} 格式打印"), "fprintf":("fprintf {1} to {0}","向 {0} 按 {1} 格式打印"),
-     "sprintf":("sprintf -> {0}, fmt {1}","按 {1} 格式写入 {0}"),
-     "snprintf":("write <= {1} bytes -> {0}, fmt {2}","最多 {1} 字节按 {2} 写入 {0}"),
      "puts":("print {0} + newline","打印 {0} 并换行"), "fputs":("write {0}","写字符串 {0}"),
      "putchar":("output char {0}","输出字符 {0}"),
      "system":("run shell: {0}","执行 shell 命令:{0}"), "popen":("run: {0}","执行命令:{0}"),
      "getenv":("read env {0}","读环境变量 {0}"),
-     "setenv":("set env {0}={1}","设环境变量 {0}={1}"), "exit":("exit({0})","退出进程 ({0})"),
+     "setenv":("set env {0}={1}","设环境变量 {0}={1}"),
+     "exit":("exit, status {0}","退出进程,状态码 {0}"), "_exit":("exit now, status {0}","立即退出,状态码 {0}"),
      "signal":("on {0} -> {1}","{0} 的处理设为 {1}"), "kill":("send {1} to pid {0}","给 pid {0} 发 {1}"),
-     "raise":("raise {0}","自发 {0}"),
+     "raise":("raise {0}","自发 {0}"), "sigaction":("set handler for {0}","设置 {0} 的处理"),
      "ptrace":("ptrace {0}","ptrace {0}"), "prctl":("prctl {0}","prctl {0}"),
      "socket":("socket {0}/{1}","套接字 {0}/{1}"),
+     "connect":("connect {0} -> {1}","{0} 连接到 {1}"), "bind":("bind {0} to {1}","{0} 绑定到 {1}"),
+     "listen":("listen on {0} (backlog {1})","在 {0} 上监听(队列 {1})"), "accept":("accept on {0}","在 {0} 上接受连接"),
+     "dup2":("dup {0} -> {1}","复制 fd {0} -> {1}"), "fcntl":("fcntl {0}: {1}","fcntl {0}: {1}"),
+     "execve":("exec {0}","执行程序 {0}"),
      "access":("access {0} ({1})","检查 {0} 的访问 ({1})"),
      "qsort":("sort {1} items of {2} bytes","排序 {1} 个元素(每个 {2} 字节)"),
-     "srand":("seed rand = {0}","随机种子 = {0}"),
+     "srand":("seed rand = {0}","随机种子 = {0}"), "srandom":("seed random = {0}","随机种子 = {0}"),
      "getrandom":("random {1} bytes -> {0}","取 {1} 随机字节 -> {0}"),
      "memalign":("alloc {1} bytes, {0}-aligned","分配 {1} 字节,{0} 对齐"),
     }
@@ -793,15 +822,47 @@ if _IN_IDA:
             parts.append("0x%X" % rest)
         return "|".join(parts) if parts else "0"
 
-    _O = [(0, "O_RDONLY"), (1, "O_WRONLY"), (2, "O_RDWR"), (0o100, "O_CREAT"),
-          (0o200, "O_EXCL"), (0o1000, "O_TRUNC"), (0o2000, "O_APPEND"), (0o4000, "O_NONBLOCK"),
-          (0o400000, "O_DIRECTORY"), (0o2000000, "O_CLOEXEC"), (0o40000, "O_LARGEFILE")]
+    # Constant values follow the Linux UAPI headers. Several differ per architecture
+    # (open/mmap flags and socket types on ARM and MIPS, signal numbers on MIPS and in
+    # the Windows CRT), so the decoders read the target from _DEC_CTX, which
+    # _collect_notes refreshes for every function it annotates.
+    _DEC_CTX = {"arch": "", "pe": False}
+
+    def _family():
+        a = _DEC_CTX["arch"] or ""
+        return "mips" if a.startswith("mips") else "arm" if a in ("arm", "aarch64") else "x86"
+
+    _O_COMMON = [(0x80000, "O_CLOEXEC"), (0x40000, "O_NOATIME"), (0x200000, "O_PATH")]
+    _O_FLAGS = {
+        "x86": [(0x40, "O_CREAT"), (0x80, "O_EXCL"), (0x100, "O_NOCTTY"), (0x200, "O_TRUNC"),
+                (0x400, "O_APPEND"), (0x800, "O_NONBLOCK"), (0x1000, "O_DSYNC"), (0x2000, "O_ASYNC"),
+                (0x4000, "O_DIRECT"), (0x8000, "O_LARGEFILE"), (0x10000, "O_DIRECTORY"),
+                (0x20000, "O_NOFOLLOW"), (0x100000, "O_SYNC"), (0x400000, "O_TMPFILE")],
+        "arm": [(0x40, "O_CREAT"), (0x80, "O_EXCL"), (0x100, "O_NOCTTY"), (0x200, "O_TRUNC"),
+                (0x400, "O_APPEND"), (0x800, "O_NONBLOCK"), (0x1000, "O_DSYNC"), (0x2000, "O_ASYNC"),
+                (0x4000, "O_DIRECTORY"), (0x8000, "O_NOFOLLOW"), (0x10000, "O_DIRECT"),
+                (0x20000, "O_LARGEFILE"), (0x100000, "O_SYNC"), (0x400000, "O_TMPFILE")],
+        "mips": [(0x8, "O_APPEND"), (0x10, "O_DSYNC"), (0x80, "O_NONBLOCK"), (0x100, "O_CREAT"),
+                 (0x200, "O_TRUNC"), (0x400, "O_EXCL"), (0x800, "O_NOCTTY"), (0x1000, "O_ASYNC"),
+                 (0x2000, "O_LARGEFILE"), (0x4000, "O_SYNC"), (0x8000, "O_DIRECT"),
+                 (0x10000, "O_DIRECTORY"), (0x20000, "O_NOFOLLOW")],
+    }
+
+    _O_WIN = [(0x8, "_O_APPEND"), (0x10, "_O_RANDOM"), (0x20, "_O_SEQUENTIAL"), (0x40, "_O_TEMPORARY"),
+              (0x80, "_O_NOINHERIT"), (0x100, "_O_CREAT"), (0x200, "_O_TRUNC"), (0x400, "_O_EXCL"),
+              (0x4000, "_O_TEXT"), (0x8000, "_O_BINARY")]
 
     def _dec_oflags(v):
-        acc = v & 3
-        base = {0: "O_RDONLY", 1: "O_WRONLY", 2: "O_RDWR"}.get(acc, "?")
-        extra = _bits(v & ~3, [(b, n) for b, n in _O if b not in (0, 1, 2)])
+        if _DEC_CTX["pe"]:                       # MSVC/MinGW CRT _open()
+            base = {0: "_O_RDONLY", 1: "_O_WRONLY", 2: "_O_RDWR"}.get(v & 3, "0x%X" % (v & 3))
+            extra = _bits(v & ~3, _O_WIN)
+            return base + ("|" + extra if extra and extra != "0" else "")
+        base = {0: "O_RDONLY", 1: "O_WRONLY", 2: "O_RDWR"}.get(v & 3, "O_ACCMODE")
+        extra = _bits(v & ~3, _O_FLAGS[_family()] + _O_COMMON)
         return base + ("|" + extra if extra and extra != "0" else "")
+
+    def _o_creat_bit():
+        return 0x100 if _DEC_CTX["pe"] or _family() == "mips" else 0x40
 
     _PROT = [(1, "PROT_READ"), (2, "PROT_WRITE"), (4, "PROT_EXEC"), (0, "PROT_NONE")]
 
@@ -809,20 +870,91 @@ if _IN_IDA:
         s = _bits(v, _PROT)
         return s + (" [RWX]" if (v & 7) == 7 else "")
 
-    _MAP = [(1, "MAP_SHARED"), (2, "MAP_PRIVATE"), (0x10, "MAP_FIXED"), (0x20, "MAP_ANONYMOUS"),
-            (0x100, "MAP_GROWSDOWN"), (0x4000, "MAP_POPULATE")]
-    _SIG = {1:"SIGHUP",2:"SIGINT",3:"SIGQUIT",4:"SIGILL",5:"SIGTRAP",6:"SIGABRT",7:"SIGBUS",
-            8:"SIGFPE",9:"SIGKILL",10:"SIGUSR1",11:"SIGSEGV",12:"SIGUSR2",13:"SIGPIPE",
-            14:"SIGALRM",15:"SIGTERM",17:"SIGCHLD",18:"SIGCONT",19:"SIGSTOP",20:"SIGTSTP"}
-    _WHENCE = {0:"SEEK_SET",1:"SEEK_CUR",2:"SEEK_END"}
+    _MAP_FLAGS = {
+        "x86": [(0x10, "MAP_FIXED"), (0x20, "MAP_ANONYMOUS"), (0x40, "MAP_32BIT"),
+                (0x100, "MAP_GROWSDOWN"), (0x800, "MAP_DENYWRITE"), (0x1000, "MAP_EXECUTABLE"),
+                (0x2000, "MAP_LOCKED"), (0x4000, "MAP_NORESERVE"), (0x8000, "MAP_POPULATE"),
+                (0x10000, "MAP_NONBLOCK"), (0x20000, "MAP_STACK"), (0x40000, "MAP_HUGETLB"),
+                (0x100000, "MAP_FIXED_NOREPLACE")],
+        "mips": [(0x10, "MAP_FIXED"), (0x400, "MAP_NORESERVE"), (0x800, "MAP_ANONYMOUS"),
+                 (0x1000, "MAP_GROWSDOWN"), (0x2000, "MAP_DENYWRITE"), (0x4000, "MAP_EXECUTABLE"),
+                 (0x8000, "MAP_LOCKED"), (0x10000, "MAP_POPULATE"), (0x20000, "MAP_NONBLOCK"),
+                 (0x40000, "MAP_STACK"), (0x80000, "MAP_HUGETLB")],
+    }
+
+    def _dec_map(v):
+        kind = {1: "MAP_SHARED", 2: "MAP_PRIVATE", 3: "MAP_SHARED_VALIDATE"}.get(v & 3)
+        fl = [(b, n) for b, n in _MAP_FLAGS["mips" if _family() == "mips" else "x86"]
+              if not (n == "MAP_32BIT" and _family() != "x86")]
+        extra = _bits(v & ~3, fl) if v & ~3 else ""
+        return "|".join(p for p in (kind, extra) if p and p != "0") or "0"
+
+    _SIG_LINUX = {1:"SIGHUP",2:"SIGINT",3:"SIGQUIT",4:"SIGILL",5:"SIGTRAP",6:"SIGABRT",7:"SIGBUS",
+                  8:"SIGFPE",9:"SIGKILL",10:"SIGUSR1",11:"SIGSEGV",12:"SIGUSR2",13:"SIGPIPE",
+                  14:"SIGALRM",15:"SIGTERM",16:"SIGSTKFLT",17:"SIGCHLD",18:"SIGCONT",19:"SIGSTOP",
+                  20:"SIGTSTP",21:"SIGTTIN",22:"SIGTTOU",23:"SIGURG",24:"SIGXCPU",25:"SIGXFSZ",
+                  26:"SIGVTALRM",27:"SIGPROF",28:"SIGWINCH",29:"SIGIO",30:"SIGPWR",31:"SIGSYS"}
+    _SIG_MIPS = {1:"SIGHUP",2:"SIGINT",3:"SIGQUIT",4:"SIGILL",5:"SIGTRAP",6:"SIGABRT",7:"SIGEMT",
+                 8:"SIGFPE",9:"SIGKILL",10:"SIGBUS",11:"SIGSEGV",12:"SIGSYS",13:"SIGPIPE",
+                 14:"SIGALRM",15:"SIGTERM",16:"SIGUSR1",17:"SIGUSR2",18:"SIGCHLD",19:"SIGPWR",
+                 20:"SIGWINCH",21:"SIGURG",22:"SIGIO",23:"SIGSTOP",24:"SIGTSTP",25:"SIGCONT",
+                 26:"SIGTTIN",27:"SIGTTOU",28:"SIGVTALRM",29:"SIGPROF",30:"SIGXCPU",31:"SIGXFSZ"}
+    _SIG_WIN = {2:"SIGINT",4:"SIGILL",6:"SIGABRT",8:"SIGFPE",11:"SIGSEGV",15:"SIGTERM",
+                21:"SIGBREAK",22:"SIGABRT"}
+
+    def _dec_sig(v):
+        t = _SIG_WIN if _DEC_CTX["pe"] else _SIG_MIPS if _family() == "mips" else _SIG_LINUX
+        return t.get(v, str(v))
+
+    def _dec_handler(v):
+        # SIG_DFL / SIG_IGN / SIG_ERR are the constants 0, 1, -1 cast to a function pointer
+        return {0: "SIG_DFL", 1: "SIG_IGN"}.get(v, "SIG_ERR" if v in (0xFFFFFFFF, (1 << 64) - 1) else "0x%X" % v)
+
+    _WHENCE = {0:"SEEK_SET",1:"SEEK_CUR",2:"SEEK_END",3:"SEEK_DATA",4:"SEEK_HOLE"}
     _PTRACE = {0:"PTRACE_TRACEME",1:"PTRACE_PEEKTEXT",2:"PTRACE_PEEKDATA",3:"PTRACE_PEEKUSER",
-               4:"PTRACE_POKETEXT",8:"PTRACE_CONT",9:"PTRACE_KILL",16:"PTRACE_ATTACH",
-               17:"PTRACE_DETACH",0x4200:"PTRACE_SETOPTIONS"}
-    _AF = {0:"AF_UNSPEC",1:"AF_UNIX",2:"AF_INET",10:"AF_INET6",17:"AF_PACKET"}
-    _SOCK = {1:"SOCK_STREAM",2:"SOCK_DGRAM",3:"SOCK_RAW"}
-    _ACCESS = [(1,"X_OK"),(2,"W_OK"),(4,"R_OK"),(0,"F_OK")]
-    _PRCTL = {1:"PR_SET_PDEATHSIG",4:"PR_SET_DUMPABLE",15:"PR_SET_NAME",22:"PR_SET_SECCOMP",
-              38:"PR_SET_NO_NEW_PRIVS",59:"PR_SET_SYSCALL_USER_DISPATCH"}
+               4:"PTRACE_POKETEXT",5:"PTRACE_POKEDATA",6:"PTRACE_POKEUSER",7:"PTRACE_CONT",
+               8:"PTRACE_KILL",9:"PTRACE_SINGLESTEP",12:"PTRACE_GETREGS",13:"PTRACE_SETREGS",
+               14:"PTRACE_GETFPREGS",15:"PTRACE_SETFPREGS",16:"PTRACE_ATTACH",17:"PTRACE_DETACH",
+               24:"PTRACE_SYSCALL",0x4200:"PTRACE_SETOPTIONS",0x4201:"PTRACE_GETEVENTMSG",
+               0x4202:"PTRACE_GETSIGINFO",0x4206:"PTRACE_SEIZE",0x4207:"PTRACE_INTERRUPT"}
+    _AF = {0:"AF_UNSPEC",1:"AF_UNIX",2:"AF_INET",10:"AF_INET6",16:"AF_NETLINK",17:"AF_PACKET",
+           31:"AF_BLUETOOTH",38:"AF_ALG",40:"AF_VSOCK"}
+
+    def _dec_socktype(v):
+        mips = _family() == "mips"
+        kind = ({1:"SOCK_DGRAM",2:"SOCK_STREAM",3:"SOCK_RAW",4:"SOCK_RDM",5:"SOCK_SEQPACKET"} if mips else
+                {1:"SOCK_STREAM",2:"SOCK_DGRAM",3:"SOCK_RAW",4:"SOCK_RDM",5:"SOCK_SEQPACKET",10:"SOCK_PACKET"})
+        out = [kind.get(v & 0xF, str(v & 0xF))]
+        if v & (0x80 if mips else 0x800):
+            out.append("SOCK_NONBLOCK")
+        if v & 0x80000:
+            out.append("SOCK_CLOEXEC")
+        return "|".join(out)
+
+    _ACCESS = [(4,"R_OK"),(2,"W_OK"),(1,"X_OK"),(0,"F_OK")]
+    _PRCTL = {1:"PR_SET_PDEATHSIG",2:"PR_GET_PDEATHSIG",3:"PR_GET_DUMPABLE",4:"PR_SET_DUMPABLE",
+              15:"PR_SET_NAME",16:"PR_GET_NAME",21:"PR_GET_SECCOMP",22:"PR_SET_SECCOMP",
+              38:"PR_SET_NO_NEW_PRIVS",39:"PR_GET_NO_NEW_PRIVS",59:"PR_SET_SYSCALL_USER_DISPATCH",
+              0x59616d61:"PR_SET_PTRACER"}
+    _FCNTL = {0:"F_DUPFD",1:"F_GETFD",2:"F_SETFD",3:"F_GETFL",4:"F_SETFL",5:"F_GETLK",6:"F_SETLK",
+              7:"F_SETLKW",8:"F_SETOWN",9:"F_GETOWN",1030:"F_DUPFD_CLOEXEC"}
+
+    _FUTEX = {0: "FUTEX_WAIT", 1: "FUTEX_WAKE", 2: "FUTEX_FD", 3: "FUTEX_REQUEUE",
+              4: "FUTEX_CMP_REQUEUE", 5: "FUTEX_WAKE_OP", 6: "FUTEX_LOCK_PI", 7: "FUTEX_UNLOCK_PI",
+              8: "FUTEX_TRYLOCK_PI", 9: "FUTEX_WAIT_BITSET", 10: "FUTEX_WAKE_BITSET"}
+
+    def _dec_futex(v):
+        s = _FUTEX.get(v & 0x7F, str(v & 0x7F))
+        if v & 128:
+            s += "|FUTEX_PRIVATE_FLAG"
+        if v & 256:
+            s += "|FUTEX_CLOCK_REALTIME"
+        return s
+
+    def _dec_char(v):
+        if 32 <= v < 127:
+            return "'%s'" % chr(v) if chr(v) not in "'\\" else "'\\%s'" % chr(v)
+        return {10: "'\\n'", 9: "'\\t'", 13: "'\\r'", 0: "'\\0'"}.get(v, str(v))
 
     def _lut(d):
         return lambda v: d.get(v, "0x%X" % v if v > 9 else str(v))
@@ -830,19 +962,24 @@ if _IN_IDA:
     # function key -> {arg index: decoder(intval)->str}
     ARG_DEC = {
         "open":   {1: _dec_oflags}, "openat": {2: _dec_oflags},
-        "mmap":   {2: _dec_prot, 3: lambda v: _bits(v, _MAP)}, "mprotect": {2: _dec_prot},
-        "mremap": {3: lambda v: _bits(v, _MAP)},
+        "mmap":   {2: _dec_prot, 3: _dec_map}, "mprotect": {2: _dec_prot},
+        "mremap": {3: lambda v: _bits(v, [(1, "MREMAP_MAYMOVE"), (2, "MREMAP_FIXED"), (4, "MREMAP_DONTUNMAP")])},
         "lseek":  {2: _lut(_WHENCE)}, "fseek": {2: _lut(_WHENCE)},
-        "kill":   {1: _lut(_SIG)}, "raise": {0: _lut(_SIG)},
-        "signal": {0: _lut(_SIG)}, "sigaction": {0: _lut(_SIG)},
+        "kill":   {1: _dec_sig}, "raise": {0: _dec_sig},
+        "signal": {0: _dec_sig, 1: _dec_handler}, "sigaction": {0: _dec_sig},
         "ptrace": {0: _lut(_PTRACE)}, "prctl": {0: _lut(_PRCTL)},
-        "socket": {0: _lut(_AF), 1: _lut(_SOCK)},
-        "setvbuf": {2: _lut({0: "_IOFBF (full)", 1: "_IOLBF (line)", 2: "_IONBF (unbuffered)"})},
+        "socket": {0: lambda v: "AF_INET6" if v == 23 and _DEC_CTX["pe"] else _AF.get(v, str(v)),
+                   1: _dec_socktype},
+        "setvbuf": {2: lambda v: {0: T("_IOFBF (full)", "_IOFBF(全缓冲)"),
+                                  1: T("_IOLBF (line)", "_IOLBF(行缓冲)"),
+                                  2: T("_IONBF (unbuffered)", "_IONBF(无缓冲)")}.get(v, str(v))},
         "access": {1: lambda v: _bits(v, _ACCESS)},
+        "fcntl":  {1: _lut(_FCNTL)}, "futex": {1: _dec_futex},
+        "putchar": {0: _dec_char}, "putc": {0: _dec_char}, "fputc": {0: _dec_char},
     }
     # functions whose first fd arg reads nicely as stdin/stdout/stderr
     _FD_FIRST = {"read", "write", "close", "dup", "dup2", "fstat", "lseek", "fsync",
-                 "ftruncate", "fcntl", "sendfile", "pread", "pwrite"}
+                 "ftruncate", "fcntl", "sendfile", "pread", "pwrite", "dprintf"}
     _FD_NAMES = {0: "stdin", 1: "stdout", 2: "stderr"}
 
     # ---------- magic constants ----------
@@ -886,28 +1023,239 @@ if _IN_IDA:
                "sha1rnds4":"SHA-1 4 rounds","sha1nexte":"SHA-1 next E","sha256rnds2":"SHA-256 2 rounds",
                "sha256msg1":"SHA-256 msg sched 1","sha256msg2":"SHA-256 msg sched 2"}
 
-    def _intrin_note(helper):
+    _LANE_ZH = {"per byte":"每字节", "per u8":"每 u8", "per 16b":"每 16 位", "per u16":"每 u16",
+                "per 32b":"每 32 位", "per u32":"每 u32", "per 64b":"每 64 位", "per u64":"每 u64",
+                "per f32":"每 f32", "per f64":"每 f64", "64b":"64 位", "128b":"128 位",
+                "256b":"256 位", "512b":"512 位"}
+    _INFIX = {"add":"+", "sub":"-", "mul":"*", "mullo":"*", "and":"&", "or":"|", "xor":"^",
+              "sll":"<<", "slli":"<<", "srl":">>", "srli":">>", "sra":">>", "srai":">>"}
+    _MMX_OP = {"pxor":"xor", "por":"or", "pand":"and", "pandn":"andnot", "mull":"mullo", "mulh":"mulhi"}
+    _VEC_FN_ZH = {"interleave lo":"交错低半", "interleave hi":"交错高半", "shuffle":"重排",
+                  "shuffle lo":"重排低半", "shuffle hi":"重排高半", "pack (sat)":"饱和打包",
+                  "pack (usat)":"无符号饱和打包", "blend":"混合"}
+
+    def _intrin_note(helper, args=()):
+        """Explain an MMX/SSE/AVX/crypto intrinsic call. `args` are the operands as
+        rendered by Hex-Rays, so the note reads `a ^ b (per 64b)` rather than just `^`."""
         h = (helper or "").lstrip("_")
+        a = [x for x in args if x]
         # crypto first (highest value)
         for k, v in _CRYPTO.items():
             if k in h:
-                return OPX + v
-        m = re.match(r"mm(?:256|512)?_(\w+?)_(epi\d+|epu\d+|ps|pd|si\d+|pi\d+)$", h)
+                return OPX + v + ("(%s)" % ", ".join(a) if a else "")
+        if h == "m_empty":
+            return OPX + T("emms (clear MMX state)", "emms(清空 MMX 状态)")
+        op = lane = None
+        m = re.match(r"mm(?:256|512)?_(?:mask_|maskz_)?(\w+?)_(epi\d+|epu\d+|ps|pd|si\d+|pi\d+)$", h)
         if m and m.group(1) in _VEC_OP:
-            lane = _VEC_LANE.get(m.group(2), m.group(2))
-            return OPX + "%s (%s)" % (_VEC_OP[m.group(1)], lane)
-        # legacy _m_* MMX intrinsics (pxor, psrlwi, paddb, ...)
+            op, lane = m.group(1), _VEC_LANE.get(m.group(2), m.group(2))
+        else:
+            # legacy _m_* MMX intrinsics (pxor, psrlwi, paddb, ...); bare pxor/por/pand are 64-bit
+            m = re.match(r"m_p?(pxor|por|pand|pandn|add|sub|mull|mulh|sll|srl|sra)([bwdq])?i?$", h)
+            if not m:
+                return None
+            op = _MMX_OP.get(m.group(1), m.group(1))
+            lane = {"b":"per byte", "w":"per 16b", "d":"per 32b", "q":"per 64b"}.get(m.group(2), "64b")
+        lane_s = T(lane, _LANE_ZH.get(lane, lane)) if lane else ""
+        if op in ("sra", "srai"):
+            lane_s = T("signed, ", "有符号, ") + lane_s
+        tail = " (%s)" % lane_s if lane_s else ""
+        if len(a) >= 2:
+            x, y = a[0], a[1]
+            if op == "xor" and x == y:
+                return OPX + "%s ^ %s = 0 (%s)" % (x, y, T("zeroing", "清零"))
+            if op in _INFIX:
+                return OPX + "%s %s %s%s" % (x, _INFIX[op], y, tail)
+            if op == "andnot":
+                return OPX + "~%s & %s%s" % (x, y, tail)
+            if op == "mulhi":
+                return OPX + T("high half of %s * %s", "%s * %s 的高半部分") % (x, y) + tail
+            if op in ("cmpeq", "cmpgt"):
+                return OPX + "%s %s %s ? ~0 : 0%s" % (x, _VEC_OP[op], y, tail)
+            return OPX + "%s(%s)%s" % (_VEC_OP[op], ", ".join(a), tail)
+        return OPX + _VEC_OP.get(op, op) + tail
+
+    # data-movement intrinsics, folded into the expression as the value they produce
+    _V_LOAD = re.compile(r"mm(?:256|512)?_(?:load[lu]?|loadl|lddqu)_\w+$")
+    _V_SCALAR = re.compile(r"mm(?:256|512)?_cvtsi(?:32|64)_si(?:64|128|256)$|m_from_int(?:64)?$|mm_cvtsi64_m64$")
+    _V_ZERO = re.compile(r"mm(?:256|512)?_setzero_\w+$")
+    _V_SPLAT = re.compile(r"mm(?:256|512)?_set1_\w+$")
+
+    def _vec_op(h):
+        """(op, lane) for an arithmetic/logic/compare intrinsic name, else None."""
+        m = re.match(r"mm(?:256|512)?_(?:mask_|maskz_)?(\w+?)_(epi\d+|epu\d+|ps|pd|si\d+|pi\d+)$", h)
+        if m and m.group(1) in _VEC_OP:
+            return m.group(1), _VEC_LANE.get(m.group(2), m.group(2))
         m = re.match(r"m_p?(pxor|por|pand|pandn|add|sub|mull|mulh|sll|srl|sra)([bwdq])?i?$", h)
-        base = {"pxor":"^","por":"|","pand":"&","pandn":"andnot","add":"+","sub":"-",
-                "mull":"*","mulh":"* hi","sll":"<<","srl":">>","sra":">>(signed)"}
-        if m and m.group(1) in base:
-            lane = {"b":"per byte","w":"per 16b","d":"per 32b","q":"per 64b"}.get(m.group(2), "")
-            return OPX + base[m.group(1)] + (" (%s)" % lane if lane else "")
-        for simple, sym in (("m_pxor","^ (xor)"),("m_por","| (or)"),("m_pand","& (and)"),
-                            ("m_empty","emms (clear MMX)")):
-            if h == simple:
-                return OPX + sym
+        if m:
+            return (_MMX_OP.get(m.group(1), m.group(1)),
+                    {"b":"per byte", "w":"per 16b", "d":"per 32b", "q":"per 64b"}.get(m.group(2), "64b"))
         return None
+
+    def _vec_text(h, a, lanes):
+        """Render one intrinsic over already-rendered operands [(text, atomic)] as
+        (text, atomic), recording its lane in `lanes`; None if it does not fold."""
+        p = lambda t: t[0] if t[1] else "(%s)" % t[0]
+        if _V_ZERO.match(h):
+            return "0", True
+        if a and _V_SPLAT.match(h):
+            return "splat(%s)" % a[0][0], True
+        if a and _V_SCALAR.match(h):
+            return a[0]
+        if a and _V_LOAD.match(h):
+            t = a[0][0]
+            if t.startswith("&") and re.match(r"&[\w.]+$", t):
+                return t[1:], True                         # *&x is x
+            return "*" + p(a[0]), True
+        vo = _vec_op(h)
+        if vo and vo[0] in ("shuffle", "shufflelo", "shufflehi") and a:
+            sh = _shuffle_text(h, a)
+            if sh:
+                return sh, True
+        if not vo or len(a) < 2:
+            return None
+        op, lane = vo
+        if op in ("unpacklo", "unpackhi") and lane in ("per 64b", "per f64"):
+            if op == "unpacklo" and lane == "per 64b":
+                # low qword of each: how compilers build a 2-element array, e.g. {"sh", "-c"}
+                return "{%s, %s}" % (a[0][0], a[1][0]), True
+            k = 0 if op == "unpacklo" else 1
+            ix2 = lambda t: t[0] if t[1] and not t[0].startswith(("*", "&")) else "(%s)" % t[0]
+            return "{%s[%d], %s[%d]}" % (ix2(a[0]), k, ix2(a[1]), k), True
+        x, y = a[0], a[1]
+        if op == "xor" and x[0] == y[0]:
+            return "0", True
+        atomic = False
+        if op in ("sll", "slli", "srl", "srli") and lane in ("128b", "256b", "512b"):
+            # _mm_slli_si128 / _mm_srli_si128 (pslldq/psrldq) shift by BYTES, per 128-bit lane
+            sym = _INFIX[op]
+            txt = "%s %s %s %s" % (p(x), sym, y[0], T("bytes", "字节"))
+            lanes.setdefault(lane, [])
+            if sym not in lanes[lane]:
+                lanes[lane].append(sym)
+            return txt, False
+        if op in ("or", "xor") and not x[1] and not y[1]:
+            # (v << n) | (v >> (w - n)) on w-bit lanes is a rotate (ChaCha, BLAKE, SipHash...)
+            rot = None
+            for a1, a2 in ((x[0], y[0]), (y[0], x[0])):
+                m1 = re.fullmatch(r"(.+) << (\d+)", a1)
+                m2 = re.fullmatch(r"(.+) >> (\d+)", a2)
+                if m1 and m2 and m1.group(1) == m2.group(1):
+                    w = int(m1.group(2)) + int(m2.group(2))
+                    if w in (16, 32, 64) and "per %db" % w in lanes:
+                        rot = (m1.group(1), int(m1.group(2)), w)
+            if rot:
+                base, n, w = rot
+                lk = "per %db" % w
+                lanes[lk] = [s for s in lanes[lk] if s not in ("<<", ">>")] + ["rotl"]
+                if not lanes[lk]:
+                    del lanes[lk]
+                return "rotl(%s, %d)" % (base, n), True
+        if op in _INFIX:
+            sym, txt = _INFIX[op], "%s %s %s" % (p(x), _INFIX[op], p(y))
+        elif op == "andnot":
+            sym, txt = "&~", "~%s & %s" % (p(x), p(y))
+        elif op in ("cmpeq", "cmpgt"):
+            sym, txt = _VEC_OP[op], "%s %s %s ? ~0 : 0" % (p(x), _VEC_OP[op], p(y))
+        elif op == "mulhi":
+            sym, txt, atomic = "hi*", T("hi(%s * %s)", "高半(%s * %s)") % (x[0], y[0]), True
+        else:                                   # min/max/avg/shuffle/unpack/pack/blend
+            sym = T(_VEC_OP[op], _VEC_FN_ZH.get(_VEC_OP[op], _VEC_OP[op]))
+            txt, atomic = "%s(%s)" % (sym, ", ".join(t[0] for t in a)), True
+        if op in ("sra", "srai"):
+            lane = "signed " + lane
+        lanes.setdefault(lane, [])
+        if sym not in lanes[lane]:
+            lanes[lane].append(sym)
+        return txt, atomic
+
+    def _shuffle_text(h, a):
+        """Spell out the lane selection of a shuffle with a constant immediate."""
+        m = re.match(r"mm(?:256|512)?_shuffle(lo|hi)?_(epi32|epi16|ps|pd)$", h)
+        if not m or len(a) < 2:
+            return None
+        imm = a[-1][0]
+        try:
+            imm = int(imm, 0) if not imm.endswith("u") else int(imm[:-1], 0)
+        except ValueError:
+            return None
+        ix = lambda t: t[0] if t[1] and not t[0].startswith(("*", "&", "-", "~")) else "(%s)" % t[0]
+        if m.group(1):                                  # shufflelo/hi_epi16: 4 of 8 words
+            off = 0 if m.group(1) == "lo" else 4
+            order = " ".join(str(off + ((imm >> (2 * i)) & 3)) for i in range(4))
+            return "%s(%s, [%s])" % (T("shuffle " + m.group(1), "重排" + ("低半" if off == 0 else "高半")),
+                                     a[0][0], order)
+        if m.group(2) == "epi32":
+            src = ix(a[0])
+            idx = [(imm >> (2 * i)) & 3 for i in range(4)]
+            if len(set(idx)) == 1:
+                return "splat(%s[%d])" % (src, idx[0])
+            if len(src) > 16:                           # do not spell a long source out 4 times
+                return "%s(%s, [%s])" % (T("shuffle", "重排"), a[0][0], " ".join(map(str, idx)))
+            return "{%s}" % ", ".join("%s[%d]" % (src, i) for i in idx)
+        if m.group(2) == "ps" and len(a) >= 3:
+            x, y = ix(a[0]), ix(a[1])
+            idx = [(imm >> (2 * i)) & 3 for i in range(4)]
+            if len(x) + len(y) > 32:
+                return "%s(%s, %s, [%d %d | %d %d])" % (T("shuffle", "重排"), a[0][0], a[1][0], *idx)
+            return "{%s[%d], %s[%d], %s[%d], %s[%d]}" % (x, idx[0], x, idx[1], y, idx[2], y, idx[3])
+        if m.group(2) == "pd" and len(a) >= 3:
+            return "{%s[%d], %s[%d]}" % (ix(a[0]), imm & 1, ix(a[1]), (imm >> 1) & 1)
+        return None
+
+    def _vec_render(cfunc, x, used, lanes, depth=0):
+        """Operand text with nested MMX/SSE intrinsic calls folded into one infix
+        expression, e.g. `v7 & (((*v5 ^ v3) + v4) >> 3)`. Folded calls go into `used`
+        so they do not get a note of their own."""
+        import ida_hexrays as hr
+        y = x
+        while y.op == hr.cot_cast and y.x is not None:
+            y = y.x
+        if depth < 8 and y.op == hr.cot_call and y.x is not None and y.x.op == hr.cot_helper:
+            sub_used, sub_lanes = set(), {}
+            sub = [_vec_render(cfunc, a, sub_used, sub_lanes, depth + 1) for a in y.a]
+            r = _vec_text((y.x.helper or "").lstrip("_"), sub, sub_lanes)
+            if r is not None:
+                used.update(sub_used)
+                used.add(y.obj_id)
+                for k, v in sub_lanes.items():
+                    lanes.setdefault(k, []).extend(s for s in v if s not in lanes.get(k, []))
+                return r
+        t = _arg_text(cfunc, x)
+        return t, " " not in t
+
+    def _lane_tail(lanes):
+        def tr(l):
+            signed = l.startswith("signed ")
+            base = l[7:] if signed else l
+            s = T(base, _LANE_ZH.get(base, base))
+            return (T("signed ", "有符号 ") + s) if signed else s
+        if not lanes:
+            return ""
+        if len(lanes) == 1:
+            return " (%s)" % tr(next(iter(lanes)))
+        return " (%s)" % "; ".join("%s %s" % (" ".join(v), tr(k)) for k, v in lanes.items())
+
+    def _vec_call_note(cfunc, e, used):
+        """Note for an intrinsic call `e`, or None. Nested foldable intrinsics are
+        rendered inline and recorded in `used`."""
+        h = (e.x.helper or "").lstrip("_")
+        sub_used, lanes = set(), {}
+        sub = [_vec_render(cfunc, a, sub_used, lanes) for a in e.a]
+        note = None
+        if _vec_op(h):
+            r = _vec_text(h, sub, lanes)
+            if r is not None:
+                if r[0] == "0" and len(sub) >= 2 and sub[0][0] == sub[1][0]:
+                    note = OPX + "%s ^ %s = 0 (%s)" % (sub[0][0], sub[1][0], T("zeroing", "清零"))
+                else:
+                    txt = r[0] if len(r[0]) <= 140 else r[0][:137] + "..."
+                    note = OPX + txt + _lane_tail(lanes)
+        if note is None:
+            note = _intrin_note(e.x.helper, [t for t, _ in sub])
+        if note:
+            used.update(sub_used)
+        return note
 
     # ---------- syscall tables (embedded) ----------
     _SYS_CACHE = None
@@ -999,6 +1347,15 @@ if _IN_IDA:
                 _scan_window(w, index, present)
         return present
 
+    def _ida_has_code():
+        import ida_segment
+        seg = ida_segment.get_first_seg()
+        while seg is not None:
+            if seg.perm & ida_segment.SEGPERM_EXEC and seg.size() > 0:
+                return True
+            seg = ida_segment.get_next_seg(seg.start_ea)
+        return any(True for _ in idautils.Functions())
+
     def _ida_image_bytes():
         """Concatenate the executable segments (for fingerprinting and packer heuristics)."""
         import ida_segment
@@ -1023,6 +1380,14 @@ if _IN_IDA:
                 data = None
         try:
             if data is not None:
+                # IDA can load an ELF yet create no segments (e.g. tampered EI_CLASS):
+                # then scan the file on disk instead of an empty IDB
+                if not _ida_has_code():
+                    r = detect(data=data, arch_hint=arch)
+                    r.setdefault("notes", []).append(T(
+                        "IDA loaded no code from this file; the file on disk was scanned instead.",
+                        "IDA 没有从该文件加载出代码,已改为扫描磁盘上的原文件。"))
+                    return r, None
                 return detect(data=data, arch_hint=arch, present_hook=_ida_present_hook), None
             # file is gone: reconstruct enough from the IDB
             hdrbytes = ida_bytes.get_bytes(idaapi.get_imagebase(), 0x1000) or b""
@@ -1153,13 +1518,16 @@ if _IN_IDA:
 
     def _apply_one_sig(signame):
         before = {ea: (ida_funcs.get_func_name(ea) or "",
-                       bool(ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB)) for ea in idautils.Functions()}
+                       bool(ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB),
+                       idc.get_func_cmt(ea, 1) or "") for ea in idautils.Functions()}
         idaapi.plan_to_apply_idasgn(signame)
         ida_auto.auto_wait()
         changed = 0
         for ea in idautils.Functions():
             nm = ida_funcs.get_func_name(ea) or ""
-            old_nm, old_lib = before.get(ea, ("", False))
+            old_nm, old_lib, old_cmt = before.get(ea, ("", False, ""))
+            if (idc.get_func_cmt(ea, 1) or "") != old_cmt and ea not in _undo["cmts"]:
+                _undo["cmts"][ea] = old_cmt            # FLIRT writes the library name here
             if old_nm != nm:
                 _undo["names"].setdefault(ea, old_nm)
                 changed += not _AUTONAME.match(nm)
@@ -1167,11 +1535,60 @@ if _IN_IDA:
                 _undo["libflag"].add(ea)       # FLIRT marks matches as library functions
         return changed
 
+    # glibc release -> the GCC that Ubuntu release builds with (when .comment is stripped)
+    _GLIBC_GCC = [("2.19", "4.8"), ("2.23", "5"), ("2.27", "7"), ("2.31", "9"), ("2.35", "11"),
+                  ("2.36", "12"), ("2.38", "13"), ("2.40", "14"), ("2.42", "15")]
+
+    def _numver(v):
+        try:
+            return tuple(int(x) for x in v.split("."))
+        except Exception:
+            return (0,)
+
+    def _pick_libgcc_sig(r, libc_ver):
+        """Name of the libgcc_<gcc>_<arch> signature to apply, or None. The GCC version
+        comes from the toolchain string, else from the glibc release's Ubuntu default."""
+        suffix = {"x86_64": "amd64", "i386": "i386", "aarch64": "aarch64"}.get(r.get("arch"))
+        if not suffix:
+            return None
+        have = {}
+        for d in _sig_dirs(r.get("arch")):
+            try:
+                for fn in os.listdir(d):
+                    m = re.match(r"libgcc_([\d.]+)_%s\.sig$" % suffix, fn)
+                    if m:
+                        have[m.group(1)] = fn[:-4]
+            except Exception:
+                pass
+        if not have:
+            return None
+        want = None
+        m = re.search(r"gcc (\d+)\.(\d+)", r.get("toolchain") or "", re.I)
+        if m:
+            want = "%s.%s" % m.groups() if m.group(1) == "4" else m.group(1)
+        elif re.match(r"\d+\.\d+$", libc_ver or ""):
+            for g, c in _GLIBC_GCC:
+                if _numver(g) <= _numver(libc_ver):
+                    want = c
+        if not want:
+            return None
+        if want in have:
+            return have[want]
+        w = _numver(want)
+        near = min(have, key=lambda v: (abs(_numver(v)[0] - w[0]), -_numver(v)[0]))
+        return have[near]
+
     def do_apply_sig(r):
         kind = r.get("kind"); best = r.get("best") or ""
-        if kind in ("pe", "go", "dynamic", "?") or not r.get("ranking"):
+        if not _ida_has_code():
+            return T("IDA loaded no code from this file, so there is nothing to name; see the detection notes.",
+                     "IDA 没有从该文件加载出代码,无可命名;见识别结果里的说明。")
+        if kind in ("pe", "go", "dynamic", "?"):
             return T("no static glibc/musl signature needed for this type (%s).",
                      "该类型(%s)不需要套静态 glibc/musl 签名。") % kind
+        if not r.get("ranking"):
+            return T("no libc build was identified (%s), so no signature is applied.",
+                     "没有识别出 libc 构建(%s),不套用签名。") % best
         # on a confident call apply the leader; when uncertain, apply the top few and
         # let FLIRT keep only byte-matching functions.
         cands = [v for v, s, h, n in r["ranking"]]
@@ -1188,6 +1605,11 @@ if _IN_IDA:
             signame = os.path.splitext(sigs[0])[0]
             total_changed += _apply_one_sig(signame)
             applied.append(signame)
+            if len(applied) == 1 and kind == "static":
+                lg = _pick_libgcc_sig(r, verstr)       # the GCC runtime linked next to libc
+                if lg:
+                    total_changed += _apply_one_sig(lg)
+                    applied.append(lg)
         if not applied:
             return T("no FLIRT .sig for %s in IDA sig/pc. Generate one with FLAIR or grab a community set.",
                      "IDA sig/pc 里没有 %s 的签名。用 FLAIR 生成或从社区签名集拿。") % best
@@ -1235,6 +1657,7 @@ if _IN_IDA:
     # ---------- argument rendering ----------
     def _fmt_num(val, size):
         if size and 0 < size <= 8:
+            val &= (1 << (8 * size)) - 1          # numval() is 64-bit: -1 in an int is 2**64-1
             signed = val - (1 << (8 * size)) if val >= (1 << (8 * size - 1)) else val
         else:
             signed = val - (1 << 64) if val >= (1 << 63) else val
@@ -1244,24 +1667,36 @@ if _IN_IDA:
             return "0x%X" % val
         return str(val)
 
-    def _str_at(ea):
-        """Return a quoted C-string at ea (typed, or raw printable bytes), else None."""
+    def _decode_text(b):
+        """bytes -> str for display: UTF-8, else GBK (common in Chinese CTF binaries)."""
+        for enc in ("utf-8", "gbk"):
+            try:
+                s = b.decode(enc)
+            except Exception:
+                continue
+            if all(ch.isprintable() or ch in "\n\r\t" for ch in s):
+                return s
+        return None
+
+    def _raw_cstr(ea):
+        """Full C string at ea (typed string literal, or untyped readable bytes), else None.
+        Code addresses are never read as text (a function's first bytes can look printable)."""
         f = ida_bytes.get_flags(ea)
+        if ida_bytes.is_code(f) or ida_funcs.get_func(ea):
+            return None
         if ida_bytes.is_data(f) and not ida_bytes.is_byte(f) and not ida_bytes.is_strlit(f):
             return None                       # a pointer/int variable (e.g. stdout), never text
-        s = idc.get_strlit_contents(ea, -1, -1)
-        if not s:
-            raw = ida_bytes.get_bytes(ea, 24) or b""
-            raw = raw.split(b"\x00", 1)[0]
-            if raw and all(32 <= c < 127 for c in raw):
-                s = raw
-        if not s:
+        b = idc.get_strlit_contents(ea, -1, -1)
+        if not b:
+            b = (ida_bytes.get_bytes(ea, 256) or b"").split(b"\x00", 1)[0]
+        return _decode_text(b) if b else None
+
+    def _str_at(ea):
+        """Return a quoted, shortened C string at ea, else None."""
+        s = _raw_cstr(ea)
+        if s is None:
             return None
-        try:
-            s = s.decode("utf-8", "replace")
-        except Exception:
-            s = "%s" % s
-        s = s.replace("\n", "\\n")
+        s = s.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
         if len(s) > 24:
             s = s[:24] + "..."
         return '"%s"' % s
@@ -1311,6 +1746,106 @@ if _IN_IDA:
             pass
         return None
 
+    # format-string functions: index of the format argument (after variant mapping)
+    _FMT_FUNCS = {"printf": 0, "vprintf": 0, "fprintf": 1, "vfprintf": 1, "dprintf": 1,
+                  "sprintf": 1, "vsprintf": 1, "snprintf": 2, "vsnprintf": 2, "syslog": 1,
+                  "scanf": 0, "fscanf": 1, "sscanf": 1}
+    _CONV = re.compile(r"%(?:\d+\$)?[-+ #0']*(\*|\d+)?(?:\.(\*|\d+))?"
+                       r"(?:hh|h|ll|l|j|z|t|L|q)?([diouxXeEfFgGaAcspnm%])")
+
+    def _cstr_arg(a):
+        """Full text of a string-literal argument (untruncated), else None."""
+        import ida_hexrays as hr
+        try:
+            while a.op == hr.cot_cast and a.x is not None:
+                a = a.x
+            if a.op == hr.cot_str:
+                return a.string
+            ea = _global_ea(a)
+            return _raw_cstr(ea) if ea is not None else None
+        except Exception:
+            return None
+
+    def _global_ea(a):
+        """Address of a global the argument names directly (x or &x), else None."""
+        import ida_hexrays as hr
+        while a.op == hr.cot_cast and a.x is not None:
+            a = a.x
+        if a.op == hr.cot_obj:
+            return a.obj_ea
+        if a.op == hr.cot_ref and a.x is not None and a.x.op == hr.cot_obj:
+            return a.x.obj_ea
+        return None
+
+    def _fmt_note(base, args, A):
+        """printf/scanf family: show the format and bind each conversion to its argument,
+        e.g. `printf "size: %zu bytes..." (%zu = n)`. Only as many arguments as the format
+        consumes are used, so Hex-Rays' guessed extra variadic args never show up."""
+        fi = _FMT_FUNCS[base]
+        if fi >= len(args):
+            return None
+        fmt = _cstr_arg(args[fi])
+        if fmt is None:
+            if base.startswith("v") or _global_ea(args[fi]) is not None:
+                # a va_list wrapper passing its format through, or a global we cannot
+                # decode: neither is evidence of a format-string bug
+                return T("%s %s", "%s 格式串 %s") % (base, A[fi])
+            return T("%s with non-literal format %s: check for a format-string bug",
+                     "%s 的格式串 %s 不是字面量, 注意格式化字符串漏洞") % (base, A[fi])
+        q = fmt.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+        q = '"%s"' % (q if len(q) <= 24 else q[:24] + "...")
+        binds, k, rest, rest_raw = [], 0, A[fi + 1:], args[fi + 1:]
+        # SysV x86-64 / AArch64 pass floating-point varargs in vector registers, which
+        # Hex-Rays does not show among the call's arguments: they take no slot here
+        fp_apart = not _DEC_CTX["pe"] and _DEC_CTX["arch"] in ("x86_64", "aarch64")
+        if not base.startswith("v"):                      # v*printf take a va_list
+            scan = base.endswith("scanf")
+            for m in _CONV.finditer(fmt):
+                conv = m.group(3)
+                if conv == "%":
+                    continue
+                extra = []
+                for star, what in ((m.group(1), T("width", "宽度")), (m.group(2), T("precision", "精度"))):
+                    if star == "*":
+                        if k < len(rest):
+                            extra.append("%s %s" % (what, rest[k]))
+                        k += 1
+                if conv == "m":                           # %m: strerror(errno), no argument
+                    continue
+                if fp_apart and not scan and conv in "eEfFgGaA":
+                    continue
+                if k < len(rest):
+                    val = rest[k]
+                    if conv == "c" and not scan:
+                        iv = _arg_int(rest_raw[k])
+                        if iv is not None:
+                            val = _dec_char(iv & 0xFF)
+                    binds.append("%s %s %s%s" % (m.group(0), "->" if scan else "=", val,
+                                                  " (%s)" % ", ".join(extra) if extra else ""))
+                k += 1
+        if len(binds) > 4:
+            binds = binds[:4] + ["..."]
+        tail = " (%s)" % ", ".join(binds) if binds else ""
+        dst = (A[0] if A else "?").replace("%", "%%")    # spliced into the templates below
+        cap = (A[1] if len(A) > 1 else "?").replace("%", "%%")
+        en, zh = {
+            "printf": ("printf %s", "格式打印 %s"), "vprintf": ("vprintf %s", "格式打印 %s"),
+            "fprintf": ("fprintf to " + dst + " %s", "向 " + dst + " 格式打印 %s"),
+            "vfprintf": ("vfprintf to " + dst + " %s", "向 " + dst + " 格式打印 %s"),
+            "dprintf": ("dprintf to " + dst + " %s", "向 " + dst + " 格式打印 %s"),
+            "sprintf": ("sprintf into " + dst + " %s", "格式化写入 " + dst + ": %s"),
+            "vsprintf": ("vsprintf into " + dst + " %s", "格式化写入 " + dst + ": %s"),
+            "snprintf": ("snprintf into %s (max %s) %%s" % (dst, cap),
+                         "格式化写入 %s (最多 %s 字节): %%s" % (dst, cap)),
+            "vsnprintf": ("vsnprintf into %s (max %s) %%s" % (dst, cap),
+                          "格式化写入 %s (最多 %s 字节): %%s" % (dst, cap)),
+            "syslog": ("syslog %s", "写 syslog %s"),
+            "scanf": ("scanf %s", "格式读入 %s"),
+            "fscanf": ("fscanf from " + dst + " %s", "从 " + dst + " 格式读入 %s"),
+            "sscanf": ("sscanf " + dst + " with %s", "按 %s 解析 " + dst),
+        }[base]
+        return T(en, zh) % q + tail
+
     def _call_note(cfunc, e, nm):
         base, keep = resolve_variant(nm)
         try:
@@ -1318,6 +1853,8 @@ if _IN_IDA:
         except Exception:
             raw = []
         args = [raw[i] for i in keep if i < len(raw)] if keep is not None else raw
+        if keep is not None and base in _FMT_FUNCS and keep:
+            args = args + raw[max(keep) + 1:]           # the variadic args after the format
         # render each arg, decoding known flag/enum/fd positions
         A = []
         decoders = ARG_DEC.get(base, {})
@@ -1329,22 +1866,91 @@ if _IN_IDA:
                 A.append("fd %d (%s)" % (iv, _FD_NAMES[iv]))
             else:
                 A.append(_arg_text(cfunc, a))
-        # raw syscall: name it from the number
+        # raw syscall: name it from the number, show as many args as the call takes
         if base == "syscall" and A:
             iv = _arg_int(args[0])
             if iv is not None:
-                name = _syscalls(_cur_arch() or "x86_64").get(iv)
+                name = _syscalls(_DEC_CTX["arch"] or "x86_64").get(iv)
                 if name:
-                    return SYS + "%s (#%d)" % (name, iv)   # extra args are Hex-Rays guesses (variadic)
+                    argc = _SYS_ARGC.get(name)
+                    if argc is None:                # unknown arity: Hex-Rays' extra args are guesses
+                        return SYS + "%s (#%d)" % (name, iv)
+                    dec = ARG_DEC.get(name) or ARG_DEC.get(name.replace("rt_", "")) or {}
+                    sa = []
+                    for k, a in enumerate(args[1:1 + argc]):
+                        v = _arg_int(a)
+                        if k in dec and v is not None:
+                            sa.append(dec[k](v))
+                        elif k == 0 and name in _FD_FIRST and v in _FD_NAMES:
+                            sa.append("%d (%s)" % (v, _FD_NAMES[v]))
+                        else:
+                            sa.append(A[1 + k])
+                    return SYS + "%s(%s) (#%d)" % (name, ", ".join(sa), iv)
+        if base in _FMT_FUNCS:
+            n = _fmt_note(base, args, A)
+            if n:
+                return PFX + n
         pair = TMPL.get(base)
         if pair:
             t = pair[1] if LANG == "zh" else pair[0]
             try:
-                return PFX + t.format(*A)
+                return PFX + _dedup_words(t.format(*A, **_derived(base, args, A)))
             except Exception:
                 pass
         d = (DESC_ZH if LANG == "zh" else DESC).get(base)
         return (PFX + d) if d else None
+
+    def _dedup_words(s):
+        # templates like "close fd {0}" / "send {1} to pid {0}" meet args named fd / pid;
+        # quoted string arguments are left exactly as they are
+        parts = re.split(r'("(?:[^"\\]|\\.)*")', s)
+        return "".join(p if i % 2 else re.sub(r"\b([A-Za-z_]\w*) \1\b", r"\1", p)
+                       for i, p in enumerate(parts))
+
+    def _derived(base, args, A):
+        """Template fields computed from several args: {n} (a byte count or phrase) and
+        {mode} (the permission bits of an O_CREAT open)."""
+        K = {"n": "", "mode": ""}
+        if base in ("fread", "fwrite", "calloc"):
+            i, j = (1, 2) if base != "calloc" else (0, 1)
+            if j < len(args):
+                x, y = _arg_int(args[i]), _arg_int(args[j])
+                if x is not None and y is not None:
+                    K["n"] = _fmt_num(x * y, 8)
+                elif x == 1 or y == 1:
+                    K["n"] = A[j] if x == 1 else A[i]
+                else:
+                    K["n"] = "%s x %s" % (A[i], A[j])
+        elif base == "sbrk" and args:
+            v = _arg_int(args[0])
+            if v is not None:
+                v = v - (1 << 64) if v >= (1 << 63) else v
+            K["n"] = (T("query the program break", "查询当前堆顶") if v == 0 else
+                      T("shrink the heap by %d bytes", "堆缩小 %d 字节") % -v if v is not None and v < 0 else
+                      T("grow the heap by %s bytes", "堆扩大 %s 字节") % (A[0] if v is None else v))
+        elif base in ("open", "openat"):
+            fi = 1 if base == "open" else 2
+            fl = _arg_int(args[fi]) if fi < len(args) else None
+            md = _arg_int(args[fi + 1]) if fi + 1 < len(args) else None
+            if fl is not None and fl & _o_creat_bit() and md is not None:
+                K["mode"] = T(", mode 0%o", ", 权限 0%o") % md
+        return K
+
+    # argument counts of the syscalls worth spelling out (names as in the kernel tables)
+    _SYS_ARGC = {"read": 3, "write": 3, "open": 3, "openat": 4, "close": 1, "lseek": 3, "mmap": 6,
+                 "mmap2": 6, "mprotect": 3, "munmap": 2, "brk": 1, "ioctl": 3, "pread64": 4,
+                 "pwrite64": 4, "readv": 3, "writev": 3, "access": 2, "pipe": 1, "pipe2": 2, "dup": 1,
+                 "dup2": 2, "dup3": 3, "nanosleep": 2, "getpid": 0, "getppid": 0, "getuid": 0,
+                 "geteuid": 0, "getgid": 0, "gettid": 0, "socket": 3, "connect": 3, "accept": 3,
+                 "accept4": 4, "sendto": 6, "recvfrom": 6, "bind": 3, "listen": 2, "fork": 0,
+                 "vfork": 0, "execve": 3, "execveat": 5, "exit": 1, "exit_group": 1, "wait4": 4,
+                 "kill": 2, "tkill": 2, "tgkill": 3, "fcntl": 3, "chdir": 1, "mkdir": 2, "rmdir": 1,
+                 "unlink": 1, "chmod": 2, "ptrace": 4, "prctl": 5, "arch_prctl": 2, "alarm": 1,
+                 "pause": 0, "getrandom": 3, "memfd_create": 2, "seccomp": 3, "rt_sigaction": 4,
+                 "rt_sigprocmask": 4, "sendfile": 4, "mremap": 5, "madvise": 3, "fstat": 2,
+                 "stat": 2, "readlink": 3, "time": 1, "setuid": 1, "setgid": 1, "chroot": 1,
+                 "getcwd": 2, "sched_yield": 0, "uname": 1, "sync": 0, "ftruncate": 2,
+                 "process_vm_readv": 6, "process_vm_writev": 6, "futex": 6}
 
     # segment-register reads Hex-Rays renders as __readfsqword(off) / __readgsdword(off)
     _SEG_ELF = {("fs", 0x0): ("thread control block", "线程控制块 TCB"),
@@ -1373,7 +1979,7 @@ if _IN_IDA:
         signed =off - (1 << 32) if off >= 0x80000000 and off < (1 << 32) else \
             off - (1 << 64) if off >= (1 << 63) else off
         if signed < 0:
-            what = ("thread-local variable (e.g. errno)", "线程局部变量（如 errno）")
+            what = ("thread-local variable", "线程局部变量")
         else:
             try:
                 import ida_ida
@@ -1401,6 +2007,14 @@ if _IN_IDA:
             pass
         return None
 
+    def _refresh_dec_ctx():
+        try:
+            import ida_ida
+            pe = ida_ida.inf_get_filetype() == ida_ida.f_PE
+        except Exception:
+            pe = False
+        _DEC_CTX.update(arch=_cur_arch() or "", pe=pe)
+
     def _collect_notes(cfunc):
         """Walk the ctree once. Returns (by_ea, by_idx):
            by_ea  {ea: text}     — for persisting as user comments (keyed by address)
@@ -1408,6 +2022,8 @@ if _IN_IDA:
                                     so parent blocks that share an ea don't match)."""
         import ida_hexrays as hr
         by_ea, by_idx = {}, {}
+        _refresh_dec_ctx()
+        used = set()          # intrinsic calls already folded into an enclosing note
 
         class _V(hr.ctree_visitor_t):
             def __init__(self):
@@ -1417,7 +2033,13 @@ if _IN_IDA:
                 if e.op == hr.cot_call and e.x is not None and e.ea != idaapi.BADADDR:
                     got = []
                     if e.x.op == hr.cot_helper:
-                        n = _intrin_note(e.x.helper) or _segread_note(e.x.helper, e)
+                        if e.obj_id in used:
+                            return 0
+                        try:
+                            n = _vec_call_note(cfunc, e, used)
+                        except Exception:
+                            n = None
+                        n = n or _segread_note(e.x.helper, e)
                         if n:
                             got.append(n)
                     elif e.x.op == hr.cot_obj:
@@ -1566,7 +2188,20 @@ if _IN_IDA:
     # ---------- disassembly math annotation ----------
     _BIN = {"add":"+", "sub":"-", "and":"&", "or":"|", "xor":"^", "imul":"*",
             "shl":"<<", "sal":"<<", "shr":">>", "sar":">>(signed)",
-            "rol":"<<<(rot)", "ror":">>>(rot)", "adc":"+(+CF)", "sbb":"-(-CF)"}
+            "rol":"<<<(rot)", "ror":">>>(rot)"}
+    _CARRY = {"adc":"%s + %s + CF", "sbb":"%s - %s - CF"}
+    # ARM/AArch64/MIPS: "op d, a, b" is d = a OP b; IDA prints "op d, b" when a == d
+    _RISC_BIN = {"add":"+", "adds":"+", "addu":"+", "addi":"+", "addiu":"+", "daddu":"+", "daddiu":"+",
+                 "sub":"-", "subs":"-", "subu":"-", "dsubu":"-",
+                 "and":"&", "ands":"&", "andi":"&", "orr":"|", "or":"|", "ori":"|",
+                 "eor":"^", "xor":"^", "xori":"^", "mul":"*", "udiv":"/", "sdiv":"/(signed)",
+                 "lsl":"<<", "sll":"<<", "sllv":"<<", "lsr":">>", "srl":">>", "srlv":">>",
+                 "asr":">>(signed)", "sra":">>(signed)", "srav":">>(signed)", "ror":">>>(rot)"}
+    _RISC_FMT = {"bic":"%s & ~%s", "bics":"%s & ~%s", "orn":"%s | ~%s", "eon":"%s ^ ~%s",
+                 "nor":"~(%s | %s)"}
+    _RISC_UN = {"neg":"-%s", "negs":"-%s", "negu":"-%s", "mvn":"~%s", "not":"~%s"}
+    _SHIFT_OP = re.compile(r"^(\w+),\s*(LSL|LSR|ASR|ROR)\s*#?(\w+)$", re.I)
+    _SHIFT_SYM = {"lsl":"<<", "lsr":">>", "asr":">>(signed)", "ror":">>>(rot)"}
     _UN = {"not":"~{d}", "neg":"-{d}", "inc":"{d} + 1", "dec":"{d} - 1"}
     _VEC = {"pxor":("^",""), "pand":("&",""), "por":("|",""), "pandn":("andnot",""),
             "paddb":("+","per byte"), "paddw":("+","per 16b"), "paddd":("+","per 32b"), "paddq":("+","per 64b"),
@@ -1580,11 +2215,44 @@ if _IN_IDA:
     def _ops(ea):
         return (idc.print_operand(ea, 0), idc.print_operand(ea, 1), idc.print_operand(ea, 2))
 
-    def _insn_math(ea):
+    def _risc_opnd(o):
+        o = o[1:] if o.startswith("#") else o
+        sh = _SHIFT_OP.match(o)
+        if sh:
+            return "(%s %s %s)" % (sh.group(1), _SHIFT_SYM[sh.group(2).lower()], sh.group(3))
+        return o
+
+    def _risc_math(m, d, s, t):
+        if not s:
+            return None
+        s, t = _risc_opnd(s), _risc_opnd(t)
+        if m in _RISC_UN and not t:
+            return "%s = %s" % (d, _RISC_UN[m] % s)
+        a, b = (s, t) if t else (d, s)
+        if m in _RISC_FMT:
+            return "%s = %s" % (d, _RISC_FMT[m] % (a, b))
+        if m in _RISC_BIN:
+            if m in ("eor", "xor") and a == b:
+                return "%s = 0" % d
+            sym = _RISC_BIN[m]
+            if sym in "+-" and re.match(r"^-(0x)?[0-9A-F]+$", b, re.I):    # addiu $sp, -0x20
+                sym, b = "-+"[sym == "-"], b[1:]
+            return "%s = %s %s %s" % (d, a, sym, b)
+        return None
+
+    def _insn_math(ea, arch=None):
         m = (idc.print_insn_mnem(ea) or "").lower()
         if not m:
             return None
         d, s, t = _ops(ea)
+        if not d:
+            return None
+        if arch is None:
+            arch = _cur_arch() or ""
+        if arch.startswith("mips") or arch in ("arm", "aarch64"):
+            return _risc_math(m, d, s, t)
+        if arch not in ("x86_64", "i386"):
+            return None
         if m.startswith("v") and t:
             base = m[1:]
             if base in _VEC:
@@ -1607,16 +2275,31 @@ if _IN_IDA:
             return "%s = %s %s %s%s" % (d, d, sym, s, g)
         if m in _FP:
             return "%s = %s %s %s" % (d, d, _FP[m], s)
-        if m in _UN and d:
+        if m in _UN:
             return "%s = %s" % (d, _UN[m].format(d=d))
         if m == "imul" and t:
-            return "%s = %s * %s" % (d, s, t)
+            return "%s = %s * %s" % (d, s or d, t)    # IDA hides the source when it is d
+        if not s:
+            return None
+        if m in _CARRY:
+            return "%s = %s" % (d, _CARRY[m] % (d, s))
         if m in _BIN:
             if m == "xor" and d == s:
                 return "%s = 0" % d
             return "%s = %s %s %s" % (d, d, _BIN[m], s)
-        if m == "lea" and s:
-            return "%s = %s" % (d, s)
+        if m == "lea":
+            # lea computes an address: [base+index*k+disp] -> base+index*k+disp, sym -> &sym
+            inner = re.sub(r"^\w+ ptr ", "", s)
+            inner = re.sub(r"^\w+:", "", inner)
+            if inner.startswith("[") and inner.endswith("]"):
+                return "%s = %s" % (d, inner[1:-1])
+            disp = re.match(r"^([^\[\]]+)\[([^\[\]]+)\]$", inner)   # ds:1[r8*4]
+            if disp:
+                off, idx = disp.groups()
+                if not re.match(r"^-?[0-9A-F]+h?$", off, re.I):
+                    return "%s = &%s + %s" % (d, off, idx)
+                return "%s = %s" % (d, idx if off == "0" else "%s+%s" % (idx, off))
+            return "%s = &%s" % (d, inner)
         return None
 
     def annotate_math(func_ea=None):
@@ -1626,8 +2309,9 @@ if _IN_IDA:
         if not f:
             return -1
         n = 0
+        arch = _cur_arch() or ""
         for ea in idautils.FuncItems(f.start_ea):
-            expr = _insn_math(ea)
+            expr = _insn_math(ea, arch)
             if not expr:
                 continue
             tagged = OPX + expr
