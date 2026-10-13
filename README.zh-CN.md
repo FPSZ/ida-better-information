@@ -273,16 +273,35 @@ $ python ida_better_reverse.py ./target --arch aarch64   # 覆盖被破坏的 e_
 $ python ida_better_reverse.py ./target --repair out     # 修复被篡改的 EI_CLASS/EI_DATA,让 IDA 能加载
 ```
 
-## 重建数据
+## 从源码构建
+
+发布的是一个生成出来的单文件。源码在 `src/ibr`，按“逻辑不依赖 IDA”的原则拆分：
+
+| 目录 | 内容 |
+|---|---|
+| `src/ibr/core/` | 运行库识别、常量解码、注释文本、撤销日志。纯 Python，不 import IDA。 |
+| `src/ibr/ports.py` | 逻辑需要反汇编器提供什么：数据库、反编译表达式、签名。 |
+| `src/ibr/app/` | 识别、套签名、加注释、撤销，只依赖 ports。 |
+| `src/ibr/adapters/` | 在 idaapi 和 Hex-Rays 上实现 ports，以及面板和命令行。 |
+| `src/ibr/analysis/` | 预留给辅助解题的分析，目前为空。 |
+
+```console
+python tools/bundle.py          # src/ibr -> ida_better_reverse.py
+python -m pytest tests          # 用内存里的假实现测 core 和 app，不需要 IDA
+```
+
+`core/` 或 `app/` 一旦 import IDA 或适配器，`tests/test_architecture.py` 就会失败。
+
+### 重建数据
 
 所有数据都由公开的发行版软件包生成，需要 Hex-Rays FLAIR（`pelf`、`sigmake`）：
 
 ```console
 python tools/build-db.py --pelf <flair>/pelf      # libc6-dev、musl-dev、libgcc-N-dev -> _db/<arch>/
-python tools/build-fingerprint.py                 # -> tools/fingerprint.bin
+python tools/build-fingerprint.py                 # -> src/ibr/data/fingerprint.bin
 python tools/make-sigs.py --sigmake <flair>/sigmake --install <IDA 目录>   # -> _sigs/，117 个 .sig
-python tools/gen-syscalls.py > tools/syscalls.json   # 可选，需要 Linux 内核头文件
-python tools/embed-fingerprint.py                 # -> ida_better_reverse.py
+python tools/gen-syscalls.py > src/ibr/data/syscalls.json   # 可选，需要 Linux 内核头文件
+python tools/bundle.py                            # -> ida_better_reverse.py
 ```
 
 ## 局限

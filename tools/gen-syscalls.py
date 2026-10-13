@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Generate tools/syscalls.json (num -> name per arch) from Linux kernel headers.
+"""Generate src/ibr/data/syscalls.json (num -> name per arch) from Linux kernel headers.
 
 Run on a Linux box (or WSL) that has libc headers installed:
     sudo apt install libc6-dev gcc-aarch64-linux-gnu
-    python3 tools/gen-syscalls.py > tools/syscalls.json
+    python3 tools/gen-syscalls.py > src/ibr/data/syscalls.json
 
 x86_64 / i386 come straight from <asm/unistd_{64,32}.h>. aarch64 uses the generic
 syscall table (asm-generic/unistd.h) expanded with the __ARCH_WANT_* macros arm64 sets.

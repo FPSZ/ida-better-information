@@ -302,17 +302,37 @@ $ python ida_better_reverse.py ./target --arch aarch64   # override a broken e_m
 $ python ida_better_reverse.py ./target --repair out     # fix tampered EI_CLASS/EI_DATA so IDA can load it
 ```
 
-## Rebuilding the data
+## Building from source
+
+The release is one generated file. The source is in `src/ibr`, split so that the logic
+does not depend on IDA:
+
+| Directory | Contents |
+|---|---|
+| `src/ibr/core/` | Runtime detection, constant decoders, note text, undo journal. Plain Python, no IDA imports. |
+| `src/ibr/ports.py` | What the logic needs from a disassembler: the database, decompiler expressions, signatures. |
+| `src/ibr/app/` | Detect, apply signatures, annotate and undo, written against the ports. |
+| `src/ibr/adapters/` | The ports implemented on idaapi and Hex-Rays, the panel, and the command line. |
+| `src/ibr/analysis/` | Reserved for challenge-solving analyses. Empty for now. |
+
+```console
+python tools/bundle.py          # src/ibr -> ida_better_reverse.py
+python -m pytest tests          # core and app against in-memory fakes; no IDA needed
+```
+
+`tests/test_architecture.py` fails when `core/` or `app/` import IDA or an adapter.
+
+### Rebuilding the data
 
 Everything is generated from public distribution packages. You need Hex-Rays FLAIR
 (`pelf`, `sigmake`):
 
 ```console
 python tools/build-db.py --pelf <flair>/pelf      # libc6-dev, musl-dev, libgcc-N-dev -> _db/<arch>/
-python tools/build-fingerprint.py                 # -> tools/fingerprint.bin
+python tools/build-fingerprint.py                 # -> src/ibr/data/fingerprint.bin
 python tools/make-sigs.py --sigmake <flair>/sigmake --install <IDA dir>   # -> _sigs/, 117 .sig files
-python tools/gen-syscalls.py > tools/syscalls.json   # optional, needs Linux kernel headers
-python tools/embed-fingerprint.py                 # -> ida_better_reverse.py
+python tools/gen-syscalls.py > src/ibr/data/syscalls.json   # optional, needs Linux kernel headers
+python tools/bundle.py                            # -> ida_better_reverse.py
 ```
 
 ## Limitations

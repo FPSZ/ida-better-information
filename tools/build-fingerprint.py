@@ -8,8 +8,10 @@ detection time the build whose anchors appear most completely in the target wins
 
 Two outputs:
   fingerprint.json  human-readable, {"format": 2, "arches": {arch: {key: [hex, ...]}}}
-  fingerprint.bin   compact form that gets embedded in the plugin (see _decode_fp in
-                    the plugin): anchors stored once per arch, versions as varint deltas.
+                    (tools/, not shipped)
+  fingerprint.bin   compact form the plugin reads (src/ibr/data/, see _decode_fp in
+                    src/ibr/core/fingerprint.py): anchors stored once per arch, versions as
+                    varint deltas. Next to out.json when an output path is given.
 
 Bytes the linker fills in or rewrites (TLS IE->LE, relocated AArch64 words; see flair_relax.py) are
 wildcarded first, so anchors never span them.
@@ -133,9 +135,11 @@ def main():
     with open(out, "w") as f:
         json.dump({"format": 2, "arches": arches}, f, separators=(",", ":"))
     blob = encode_bin(arches)
-    with open(os.path.splitext(out)[0] + ".bin", "wb") as f:
+    binpath = (os.path.splitext(out)[0] + ".bin" if len(args) > 1 else
+               os.path.join(here, "..", "src", "ibr", "data", "fingerprint.bin"))
+    with open(binpath, "wb") as f:
         f.write(blob)
-    print("-> %s (%d bytes json, %d bytes bin)" % (out, os.path.getsize(out), len(blob)))
+    print("-> %s (%d bytes json), %s (%d bytes)" % (out, os.path.getsize(out), os.path.normpath(binpath), len(blob)))
 
 
 if __name__ == "__main__":

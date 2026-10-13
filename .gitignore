@@ -12,3 +12,4 @@ tools/fingerprint.json
 *.til
 _sigs/
 _*build.log
+.pytest_cache/
