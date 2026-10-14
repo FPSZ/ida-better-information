@@ -157,11 +157,17 @@ def test_a_pointer_shows_where_it_points():
     assert 'snprintf(v42, 256, "%s.key", v11)' not in on      # writes a buffer: not a print
 
 
+def by_line(chart, m):
+    return {chart.lines[lid].text: kinds for lid, kinds in m.items()}
+
+
 def test_names_computed_from_it_and_what_it_comes_from():
     """An in-place encryption: buf = malloc; fread(buf); p = buf; do { t = *p ^ k;
-    *p = t + k; ++p } while (p != end); puts(buf). Following the key k marks what is computed
-    from it: t, and the buffer written through p (p and buf); following t marks k as where it
-    comes from and p's memory as both (read, then written back)."""
+    *p = t + k; ++p } while (p != end); puts(buf). Names are marked line by line. Following
+    the key k marks what is computed from it: t, the buffer written through p, read by puts.
+    Following t marks, on its own line and above, what makes it (k, the buffer p points at,
+    filled from the file), and below what it makes; the buffer written back below is not a
+    source, though the next pass reads it."""
     p, buf = (lambda: var(4, ptr=True)), (lambda: var(1, ptr=True))
     body = block(
         st(asg(buf(), call("malloc", var(2)))),
@@ -179,13 +185,45 @@ def test_names_computed_from_it_and_what_it_comes_from():
     chart = build_chart(body, an)
 
     def around(n):
-        return marks(chart, an, var_flow(body, var=n, an=an, may=True), n)
-    key = around(3)
-    assert key.get("v5") == "into" and key.get("v4") == "into" and key.get("v1") == "into", key
-    assert "v3" not in key and "v2" not in key                # not itself, not the size
-    tmp = around(5)
-    assert tmp.get("v3") == "from" and tmp.get("v4") == "both", tmp
-    assert tmp.get("v6") == "from"                             # the buffer came from the file
+        return by_line(chart, marks(chart, an, var_flow(body, var=n, an=an, may=True), n))
+    assert around(3) == {"v5 = *v4 ^ v3": {"v5": "into"},
+                         "*v4 = v5 + v3": {"v4": "into", "v5": "into"},
+                         "puts(v1)": {"v1": "into"}}
+    assert around(5) == {"fread(v1, 1, v2, v6)": {"v1": "from", "v6": "from"},
+                         "v3 = 90": {"v3": "from"},
+                         "v5 = *v4 ^ v3": {"v4": "from", "v3": "from"},
+                         "*v4 = v5 + v3": {"v4": "into"},
+                         "puts(v1)": {"v1": "into"}}
+    # the followed pointer's memory: t is made from it, then makes it again
+    assert around(4)["v5 = *v4 ^ v3"] == {"v5": "both", "v3": "from"}
+
+
+def test_a_source_used_again_later_is_not_marked_there():
+    """As in Butterfly: the sources of v29 appear again after it (the loop's check, a call,
+    a print). There they make nothing that v29 is made from: not marked. The call that reads
+    the buffer v29 went into marks that buffer's pointer as where it goes."""
+    P = lambda n: var(n, ptr=True)
+    body = block(
+        st(asg(P(19), call("malloc", var(7)))),
+        st(call("fread", P(19), num(1), var(7), P(6))),
+        st(asg(var(3), num(0x5A))),
+        st(asg(P(28), P(19))),
+        Tree("do", x=bin_("!=", P(28), P(8)), ea=next(_ids), body=[block(
+            st(asg(var(29), bin_("^", Tree("ptr", x=P(28)), var(3)))),
+            st(asg(Tree("ptr", x=P(28)), bin_("+", var(29), var(3)))),
+            st(Tree("inc", op="pre", x=P(28))),
+        )]),
+        st(call("check", P(19), var(7), lib=False)),
+        st(call("printf", s_("%d %d"), var(7), var(3))),
+    )
+    an = analyze(body)
+    chart = build_chart(body, an)
+    got = by_line(chart, marks(chart, an, var_flow(body, var=29, an=an, may=True), 29))
+    assert got == {"fread(v19, 1, v7, v6)": {"v19": "from", "v6": "from"},
+                   "v3 = 90": {"v3": "from"},
+                   "v29 = *v28 ^ v3": {"v28": "from", "v3": "from"},
+                   "*v28 = v29 + v3": {"v28": "into"},
+                   "check(v19, v7)": {"v19": "into"}}
 
 
 def test_a_count_does_not_make_what_a_call_fills():
@@ -198,11 +236,11 @@ def test_a_count_does_not_make_what_a_call_fills():
     )
     an = analyze(body)
     chart = build_chart(body, an)
-    count = marks(chart, an, var_flow(body, var=7, an=an, may=True), 7)
-    assert "v30" not in count and "v18" not in count, count
-    data = marks(chart, an, var_flow(body, var=30, an=an, may=True), 30)
-    assert data.get("v18") == "from" and data.get("v16") == "from", data   # the buffer, the file
-    assert "v7" not in data, data
+    count = by_line(chart, marks(chart, an, var_flow(body, var=7, an=an, may=True), 7))
+    assert all("v30" not in m and "v18" not in m for m in count.values()), count
+    data = by_line(chart, marks(chart, an, var_flow(body, var=30, an=an, may=True), 30))
+    assert data == {"v20 = fread(v18, 1, v7, v16)": {"v18": "from", "v16": "from"},   # the buffer, the file
+                    "v30 = *v18": {"v18": "from"}}
 
 
 def test_through_unknown_calls_to_the_check_and_back_to_the_input():

@@ -2,10 +2,10 @@
 one. analysis/flowchart.py says what is in it, core/chartlayout.py where it goes; this file
 draws it with Qt inside an IDA form.
 
-The lines that belong to the followed variable are drawn in full, its name marked wherever
-it appears, and the names it is computed from (▲) and those computed from it (▼) marked in
-their own colours; everything else is faded, so following another variable only moves the
-light. A legend in the top-left corner says what the colours mean.
+The lines that belong to the followed variable are drawn in full and its name is marked
+wherever it appears. The names it is computed from (▲, on its line and above) and those
+computed from it (▼, below) are marked in their own colours on the lines where they take part
+in it; everything else is faded, so following another variable only moves the light. A legend in the top-left corner says what the colours mean.
 A click on a shape lights the way from the start to it instead (which conditions, which
 exit), ending there; a click on empty space or Esc goes back to the variable.
 The drawing sits on a canvas, used like a map: drag it anywhere, the wheel zooms about the
@@ -201,7 +201,7 @@ class _Shape(QtWidgets.QGraphicsItem):
         fm = view.fm
         for lid, text, x, y in self.rows:
             lit = lid in self.lit or self.box.kind in ("start", "end")
-            for a, b, colour in frame.marked(text):
+            for a, b, colour in frame.marked(lid, text):
                 x0 = x + fm.horizontalAdvance(text[:a])
                 r = QtCore.QRectF(x0 - 1.5, y - fm.ascent() - 1, fm.horizontalAdvance(text[a:b]) + 3,
                                   fm.height() + 2)
@@ -353,7 +353,8 @@ class _Frame:
         self.depth, self.scale, self.eas = depth, scale, tuple(eas)
         self.entry, self.shape, self.panel = entry, shape, None
         self.goal = None                          # the shape whose way is shown, if any
-        self.chosen, self.marks, self._mark_rx = (), {}, None
+        self.chosen, self._mark_rx = (), None
+        self.marks = {}                           # {line id: {name: "from" | "into" | "both"}}
         self.args = {}                            # {call line id: arguments the light goes into}
         self._var = (set(), (), "", {})           # what the variable lights: back to it after a way
         self._ref_rx = _rx(chart.refs)
@@ -390,21 +391,26 @@ class _Frame:
         """The chart's variables, globals and functions named in a text row (outside strings)."""
         return _outside_strings(self._ref_rx, text)
 
-    def marked(self, text):
-        """[(start, end, colour)] of the marked names in a text row."""
-        return [(m.start(), m.end(), self.marks[m.group(0)])
-                for m in _outside_strings(self._mark_rx, text)]
+    def marked(self, lid, text):
+        """[(start, end, colour)] of the marked names in a text row of line lid: the chosen
+        names wherever they are, the others on the lines where they take part."""
+        here = self.marks.get(lid, {})
+        out = []
+        for m in _outside_strings(self._mark_rx, text):
+            k = "mark" if m.group(0) in self.chosen else here.get(m.group(0))
+            if k:
+                out.append((m.start(), m.end(), k))
+        return out
 
     # ---- light ----
     def light(self, lit, chosen=(), lines=None, around=None):
         """lit: chart line ids drawn in full; lines: the indexes of the lines between shapes
-        drawn in full (None: those that touch a lit shape); around: {name: "from" | "into" |
-        "both"} marked next to the chosen names."""
+        drawn in full (None: those that touch a lit shape); around: {line id: {name: "from" |
+        "into" | "both"}} marked next to the chosen names."""
         self.chosen = tuple(chosen)
-        self.marks = {n: k for n, k in (around or {}).items() if n not in self.chosen}
-        for n in self.chosen:
-            self.marks[n] = "mark"
-        self._mark_rx = _rx(self.marks)
+        self.marks = {lid: {n: k for n, k in m.items() if n not in self.chosen}
+                      for lid, m in (around or {}).items()}
+        self._mark_rx = _rx(set(self.chosen).union(*(m.keys() for m in self.marks.values())))
         for it in self.shapes.values():
             it.lit = {line.id for line in it.box.lines if line.id in lit}
             it.update()
@@ -571,7 +577,7 @@ class GraphView(QtWidgets.QGraphicsView):
             rows.append(square("line") + " " + T("path", "经过路径") + "&nbsp;&nbsp;" +
                         square("faded_line") + " " + T("not on the path", "未经过"))
         elif fr.chosen:
-            kinds = set(fr.marks.values())
+            kinds = {k for m in fr.marks.values() for k in m.values()}
             rows.append(chip("mark", ", ".join(fr.chosen)) + " " + T("current variable", "当前变量"))
             if "from" in kinds:
                 rows.append(chip("from", "▲") + " " + T("source", "来源"))

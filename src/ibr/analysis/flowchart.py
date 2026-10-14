@@ -566,17 +566,78 @@ def marks(chart, an, flow, var=None):
     return around(chart, an, flow, var)[0]
 
 
-def around(chart, an, flow, var=None):
-    """({name: "from" | "into" | "both"}, {line id: argument positions}).
+def merge_marks(a, b):
+    """The names of two around(...) results on one chart (two arguments followed at once)."""
+    out = {lid: dict(m) for lid, m in a.items()}
+    for lid, m in b.items():
+        mine = out.setdefault(lid, {})
+        for n, k in m.items():
+            mine[n] = k if mine.get(n) in (None, k) else "both"
+    return out
 
-    The names: the variables and globals the followed value is
-    computed from (▲) and those computed from it (▼), step by step along the definitions that
-    reach each use. One that is both, through a loop, gets the nearer of the two, or "both"
-    when they are as near (tmp = *p ^ k; *p = tmp + k: p is both for tmp). A
-    pointer stands for the memory it points at: the pointer an encryption loop writes through
-    is "into" when what it writes comes from the value. Data only: the count handed to fread
-    does not make fread's buffer, and a pointer copy computes nothing (the pointers a
-    followed pointer is copied from are "from").
+
+def _drawn_order(chart):
+    """{line id: its place from the top as drawn}: a do loop's condition after its body, a
+    for loop's step after its body."""
+    order = {}
+
+    def box(b):
+        if b is not None:
+            for line in chart.boxes[b].lines:
+                order.setdefault(line.id, len(order))
+
+    def walk(n):
+        if isinstance(n, cl.Seq):
+            for x in n.items:
+                walk(x)
+        elif isinstance(n, (cl.Leaf, cl.Stop)):
+            box(n.box)
+        elif isinstance(n, cl.If):
+            box(n.box)
+            walk(n.yes)
+            walk(n.no)
+        elif isinstance(n, cl.While):
+            box(n.box)
+            walk(n.body)
+            box(n.step)
+        elif isinstance(n, cl.DoWhile):
+            walk(n.body)
+            box(n.box)
+        elif isinstance(n, cl.Switch):
+            box(n.box)
+            for _, body in n.cases:
+                walk(body)
+    walk(chart.root)
+    return order
+
+
+def _from_entry(an, key):
+    """The sites the value key has on entry reaches (until something assigns it)."""
+    seen, stack = {0}, [0]
+    while stack:
+        n = stack.pop()
+        for m in an.g.succ[n]:
+            if m not in seen:
+                seen.add(m)
+                if key not in an.sites[m].defs:
+                    stack.append(m)
+    return seen
+
+
+def around(chart, an, flow, var=None):
+    """({line id: {name: "from" | "into" | "both"}}, {line id: argument positions}).
+
+    The names, line by line: on the lines the followed value is computed from, above where it
+    is assigned, the variables and globals that make it (▲); on the lines below, those computed
+    from it (▼). Each is found step by step along the definitions that reach each use, a step
+    from a use going up to what it reads (from) or down to what reads it (into): what a loop
+    carries round to its next pass is not marked, and a name is marked on the lines where it
+    takes part in the value, not wherever it appears. A line that is both (between two
+    assignments of the variable: made from the first, making the second) marks its names
+    "both". A pointer stands for the memory it points at: the pointer an encryption loop
+    writes through is "into" there when what it writes comes from the value. Data only: the
+    count handed to fread does not make fread's buffer, and a pointer copy computes nothing
+    (the pointers a followed pointer is copied from are "from" where it is copied).
 
     The arguments: for each line that calls a function of the program's own, the arguments
     the value is handed over in: the variable itself, a value computed from it, or a pointer
@@ -589,9 +650,29 @@ def around(chart, an, flow, var=None):
     for i, s in kept.items():
         for k in s.reads():
             readers.setdefault(k, []).append(i)
+    on_lines = {}
+    for line in chart.lines:
+        if line.site is not None:
+            on_lines.setdefault(line.site, []).append(line.id)
+    drawn = _drawn_order(chart)
+    pos = {i: min(drawn[lid] for lid in v) for i, v in on_lines.items() if all(lid in drawn for lid in v)}
 
-    # forward: what each site reads that carries the value, and what it makes from it
-    into, carry = {}, {i: s.reads() & keys for i, s in kept.items()}
+    def above(a, b):
+        """Site a is drawn above site b (or one of them is not drawn: no say)."""
+        return a not in pos or b not in pos or pos[a] < pos[b]
+
+    # forward, downwards: what each site reads that carries the value, and what it makes
+    fresh = {}
+    carry = {}
+    for i, s in kept.items():
+        c = set()
+        for k in s.reads() & keys:
+            if k not in fresh:
+                fresh[k] = _from_entry(an, k)
+            if i in fresh[k] or any(above(d, i) for d in an.reach(i, k)):
+                c.add(k)                          # not only what the loop brings round
+        carry[i] = c
+    into, made = {}, {}
     frontier, level = {i for i, c in carry.items() if c}, 0
     while frontier and level < 64:
         level += 1
@@ -600,16 +681,17 @@ def around(chart, an, flow, var=None):
             data, filled = w[i]
             if all(k[0] == "v" for k in carry[i]):   # a count or a flag: not what a known call fills
                 data = data - filled
+            made[i] = data - keys
             for k in data - keys:
                 into.setdefault(k, level)
                 for r in readers.get(k, ()):
-                    if r != i and k not in carry[r] and i in an.reach(r, k):
+                    if r != i and k not in carry[r] and above(i, r) and i in an.reach(r, k):
                         carry[r].add(k)
                         nxt.add(r)
         frontier = nxt
 
-    # backward: what each site is asked to make, and what it makes it from
-    frm, want = {}, {i: w[i][0] & keys for i in kept}
+    # backward, upwards: what each site is asked to make, and what it makes it from
+    want, src = {i: w[i][0] & keys for i in kept}, {}
     frontier, level = {i for i, m in want.items() if m}, 0
     while frontier and level < 64:
         level += 1
@@ -621,10 +703,10 @@ def around(chart, an, flow, var=None):
             rd = {k for k in s.reads() if not (k[0] == "v" and k[1] in ptr)} - keys
             if want[i] <= w[i][1]:                    # fread's buffer: from the file, not the count
                 rd = {k for k in rd if k[0] != "v"}
+            src[i] = rd
             for k in rd:
-                frm.setdefault(k, level)
                 for d in an.reach(i, k):
-                    if d != i and d in kept and k in w[d][0] and k not in want[d]:
+                    if d != i and d in kept and k in w[d][0] and k not in want[d] and above(d, i):
                         want[d].add(k)
                         nxt.add(d)
         frontier = nxt
@@ -633,41 +715,42 @@ def around(chart, an, flow, var=None):
     for nm, ref in chart.refs.items():
         names.setdefault(ref, nm)
 
-    def name(k):
+    def named(k, s):
+        """How key k is written at site s: a variable or a global by its name, other memory
+        by the pointers into it there."""
         if k[0] in ("v", "stk"):
-            return names.get(("var", k[1])) if k[1] != var else None
+            return [names[("var", k[1])]] if k[1] != var and ("var", k[1]) in names else []
         if k[0] == "g":
-            return names.get(("obj", k[1]))
-        return None
+            return [names[("obj", k[1])]] if ("obj", k[1]) in names else []
+        out = []
+        for p in _vars(s.expr, set()):
+            if p in ptr and p != var and ("var", p) in names and k in an._pts_var(p, s):
+                out.append(names[("var", p)])
+        return out
 
-    dist = {"from": {}, "into": {}}
-    for kind, got in (("from", frm), ("into", into)):
-        mem = {}
-        for k, d in got.items():
-            n = name(k)
-            if n is not None:
-                dist[kind][n] = min(d, dist[kind].get(n, d))
-            elif k[0] not in ("v", "stk", "g"):
-                mem[k] = d
-        if mem:                                   # memory with no name: the pointers into it
-            for s in kept.values():
-                for p in _vars(s.expr, set()):
-                    n = names.get(("var", p))
-                    if p in ptr and p != var and n is not None:
-                        hit = [mem[o] for o in an._pts_var(p, s) if o in mem]
-                        if hit:
-                            dist[kind][n] = min(min(hit), dist[kind].get(n, 1e9))
     out = {}
-    for n in set(dist["from"]) | set(dist["into"]):
-        f, t = dist["from"].get(n, 1e9), dist["into"].get(n, 1e9)
-        out[n] = "into" if t < f else "from" if f < t else "both"
+
+    def put(i, ks, kind):
+        s = an.sites[i]
+        for k in ks:
+            for n in named(k, s):
+                for lid in on_lines.get(i, ()):
+                    m = out.setdefault(lid, {})
+                    m[n] = kind if m.get(n) in (None, kind) else "both"
+
+    for i, c in carry.items():
+        if c:
+            put(i, (c - keys) | made.get(i, set()), "into")
+    for i, rd in src.items():
+        put(i, (want[i] - keys) | rd, "from")
     if var is not None and var in ptr:
         copied = set()
-        _provenance(an, var, copied)
-        for p in copied:
-            n = names.get(("var", p))
-            if n is not None:
-                out[n] = "from"
+        for i in _provenance(an, var, copied):
+            s = an.sites[i]
+            for p in _vars(s.expr, set()) & copied:
+                if ("var", p) in names:
+                    for lid in on_lines.get(i, ()):
+                        out.setdefault(lid, {})[names[("var", p)]] = "from"
 
     data = keys | set(into)
     args = {}

@@ -21,7 +21,7 @@ import ida_lines
 import ida_name
 
 from ...analysis.dataflow import analyze, var_flow
-from ...analysis.flowchart import around, build_chart, lit
+from ...analysis.flowchart import around, build_chart, lit, merge_marks
 from ...core.i18n import T
 from .fntree import function_tree, var_info
 from .live import _line_item_indices
@@ -91,8 +91,9 @@ class FlowText:
 
     # ---- the flowchart ----
     def chart_data(self):
-        """(chart, lit line ids, the name to mark, message, {name: "from" | "into" | "both"}
-        for the names around it, {line id: argument positions} of the calls it is handed to).
+        """(chart, lit line ids, the name to mark, message, {line id: {name: "from" | "into" |
+        "both"}} for the names around it, {line id: argument positions} of the calls it is
+        handed to).
         One chart per function, made once: following another variable only changes what is
         lit."""
         chart = _CACHE.get("chart")
@@ -301,15 +302,15 @@ class _Callees:
         return (on,) + (around(e.chart, e.an, flow, var) if on else ({}, {}))
 
     def args(self, e, positions):
-        """(lit line ids, names, {name: from / into / both}, {line id: argument positions})
-        for the function's arguments at positions."""
+        """(lit line ids, names, {line id: {name: from / into / both}}, {line id: argument
+        positions}) for the function's arguments at positions."""
         on, chosen, names, args = set(), [], {}, {}
         for i in positions:
             if i < len(e.argidx):
                 n = e.argidx[i]
                 a, m, g = self._one(e, var=n)
                 on |= a
-                names.update(m)
+                names = merge_marks(names, m)
                 for k, v in g.items():
                     args[k] = tuple(sorted(set(args.get(k, ())) | set(v)))
                 chosen.append(e.names.get(n, "?"))

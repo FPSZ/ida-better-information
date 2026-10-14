@@ -77,10 +77,11 @@ Double-click a variable to follow it instead; Esc goes back.
 statements in order, conditions as diamonds with yes/no exits, input and output as
 parallelograms, calls of the program's own functions with double sides, loops back on the
 left and out on the right, error branches in a column of their own. Arithmetic is written as
-math (`v19 <<< 1`, `(per byte)`), not as intrinsics. The followed variable is marked yellow,
-what is computed from it blue (▼) and what it is computed from purple (▲); the lines that
-have nothing to do with it are faded, and a legend says which is which. Click a step to light
-the path that leads to it.
+math (`v19 <<< 1`, `(per byte)`), not as intrinsics. The followed variable is marked yellow.
+What it is computed from is purple (▲) and what is computed from it blue (▼), each only on the
+lines where it takes part: the sources on its line and above, what it goes into below. The
+lines that have nothing to do with it are faded, and a legend says which is which. Click a step
+to light the path that leads to it.
 
 <p align="center">
   <img src="docs/img/flowchart.png" alt="Flowchart of Butterfly's main with the key v23: v24, v18, v19 and the buffer pointers marked as computed from it" width="49%">
@@ -147,10 +148,11 @@ None was misclassified. The command line identifies all 19 in 2.0 s.
 
 For seven QWB challenges, the 40 largest functions of each (238 functions) were charted and
 every variable of each (up to 40, 4,500 in all) was followed: no error, no two shapes
-overlapping, no line through a shape. The largest function, 2,089 pseudocode lines, took at
-most 1.5 s to chart and 1.7 s to follow another variable. The test suite lays out 150 random
-function shapes with the same checks. Opening calls was exercised three calls deep in xrtFuze
-and in ez_vm (QWB 2024, a 2,000-line VM loop); a called function's chart took 11–41 ms to make.
+overlapping, no line through a shape. The largest chart has 2,089 lines (statements and
+conditions); no chart took more than 1.0 s to make, nor following another variable more than
+1.0 s. The test suite lays out 150 random function shapes with the same checks. Opening calls
+was exercised three calls deep in xrtFuze and in ez_vm (QWB 2024, a VM interpreter); a called
+function's chart took 11–41 ms to make.
 
 ### Undo
 
