@@ -41,6 +41,73 @@ class Expr:
         raise NotImplementedError
 
 
+class Tree:
+    """One item of a decompiled function, statement or expression, as the analyses read it.
+    A plain data record: adapters build it once per decompilation.
+
+    kind  statements:
+            "block"    body = statements
+            "expr"     x = the expression
+            "if"       x = condition, body = [then] or [then, else]
+            "for"      init, x = condition (or None), step, body = [loop body]
+            "while"    x = condition, body = [loop body]
+            "do"       body = [loop body], x = condition
+            "switch"   x = value, body = case statements in order, each with `values`
+                       (its case values; none for default)
+            "return"   x = value or None
+            "goto"     target = label number
+            "break", "continue", "other"
+          expressions:
+            "asg"      x = y; op "" for =, else the operator of a compound assignment ("+", "^", ...)
+            "inc", "dec"   ++x / x++ / --x / x--
+            "var"      local variable number `var`, `name`
+            "obj"      global at obj_ea, `name`, `decl` (its declaration, "" for a function),
+                       `text` as the decompiler prints it; a string literal: strlit, `string`;
+                       a function: `lib` when it is a library function or an import
+            "num"      `value`, and `text` as the decompiler prints it ("0x3Fu")
+            "str", "helper" (an intrinsic's name in `name`)
+            "call"     x = callee (an "obj" or "helper" with a name), args
+            "ptr"      *x
+            "idx"      x[y]
+            "mem"      x.f (op ".") or x->f (op "->"), the field's name in `name`
+            "ref"      &x
+            "cast"     (type)x
+            "bin"      x op y;  "un"  op x;  "tern"  x ? y : z;  "comma"  x, y
+            "other"    args = operands
+    label  label number this statement carries (a goto target), or None
+    ptr    the expression's type is a pointer
+    mem    the expression is memory rather than a value: an array or structure
+    index  item number in the printed function: lines carry it (see the adapter)
+    """
+    kind = "other"
+    op = ""
+    x = y = z = None
+    init = step = None
+    args = ()
+    body = ()
+    label = None
+    target = None
+    var = None
+    name = ""
+    ea = None
+    index = None
+    ptr = False
+    mem = False
+    value = 0
+    text = ""
+    string = ""
+    obj_ea = None
+    decl = ""
+    strlit = False
+    lib = False
+    values = ()
+
+    def __init__(self, kind, **kw):
+        self.kind = kind
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
 class Program:
     """The disassembler database."""
 
@@ -176,7 +243,11 @@ class Signatures:
 
 
 class Decompiler:
-    """Comments stored with decompiled code."""
+    """Decompiled code: its statement tree, and the comments stored with it."""
+
+    def function_tree(self, func_ea):
+        """(body as a Tree "block", {var number: name}) of one function, or None."""
+        raise NotImplementedError
 
     def pseudo_comments(self, func_ea, locs):
         """{loc: current text} for the given comment locations of one function."""

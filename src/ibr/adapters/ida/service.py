@@ -1,6 +1,6 @@
 """The plugin's operations for the panel, scripts and idalib, bound to this IDA session.
 
-These names are also what the single-file build exports at top level."""
+These names are also exported at the top level of ida_better_reverse.py."""
 import ida_kernwin
 
 from ...app import annotate as _annotate

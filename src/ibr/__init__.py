@@ -5,8 +5,9 @@ Layout (ports and adapters):
   ports.py   what the application needs from a disassembler (database, decompiler, signatures)
   app/       use cases (detect, apply signatures, annotate, undo) written against the ports
   adapters/  IDA (idaapi, Hex-Rays, Qt panel) and the standalone CLI
-  analysis/  reserved for challenge-solving analyses (not implemented yet)
+  analysis/  analyses of the program's own code: data flow, flowchart (more planned)
 
-The release is a single file built by tools/bundle.py.
+The release is a zip built by tools/package.py: the entry file ida_better_reverse.py
+plus this package, installed as plugins/ida_better_reverse.py and plugins/ida_better_reverse/ibr.
 """
-__version__ = "2.3.0"
+__version__ = "2.4.0"

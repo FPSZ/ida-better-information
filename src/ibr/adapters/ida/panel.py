@@ -88,6 +88,11 @@ if _HAS_QT:
         def on_lang(self, idx):
             i18n.set_lang("zh" if idx == 1 else "en")
             save_lang(); self._retext()
+            try:                                        # data-flow menu entry and window
+                from . import flowview
+                flowview.relabel()
+            except Exception:
+                pass
             if self._r:
                 self.result.setPlainText(_fmt(self._r))
             set_live_render(self.cb_live.isChecked())    # re-render in new language
